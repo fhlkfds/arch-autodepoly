@@ -1,0 +1,15 @@
+---
+# The AUR is third-party. A PKGBUILD can stop building for reasons nothing in
+# this repository can fix (moved upstream tarball, an inactive maintainer), so
+# an AUR package that will not build is reported and skipped rather than
+# halting a provisioning run that is otherwise healthy.
+# Set this to true to get the previous behaviour back, where any requested AUR
+# package that will not install stops the play.
+aur_fail_hard: false
+
+# Attempt budget for the per-package retry that follows a failed batch install.
+# `retries` counts total attempts, not extra ones: 2 means yay runs twice for a
+# package before the run gives up on it. The delay covers the transient causes
+# worth waiting out, such as a concurrent pacman database lock.
+aur_install_retries: 2
+aur_install_retry_delay: 10

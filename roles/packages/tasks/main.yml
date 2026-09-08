@@ -155,8 +155,32 @@
       - --answerdiff
       - None
 
+# The AUR is third-party, so every requested package now ends this chain in
+# exactly one of three outcomes rather than pass/fail:
+#   INSTALLED         the batch install, or a later individual retry, succeeded.
+#   RETRYABLE_FAILURE yay never finished its agreed number of attempts (module
+#                     error, lost become, missing yay). That is a host or
+#                     controller problem, not upstream breakage, so it still
+#                     stops the run via the assert below.
+#   UPSTREAM_BROKEN   yay ran its whole retry budget and the package still will
+#                     not build. Recorded in aur_skipped_packages, reported
+#                     loudly after this block, and the play continues.
+# Rollback: set aur_fail_hard=true (roles/packages/defaults/main.yml) to restore
+# the old behaviour where any uninstallable AUR package halts provisioning.
+- name: Initialise the AUR installation outcome facts
+  ansible.builtin.set_fact:
+    aur_installed_packages: []
+    aur_retryable_failed_packages: []
+    aur_skipped_packages: []
+
+# This block deliberately carries no `when:`. A block-level condition is
+# inherited by its `always` section too, so gating the block would let a stale
+# sudoers grant from an interrupted earlier run survive any run that happened to
+# have nothing to install. The install tasks carry the condition individually,
+# which makes the privilege cleanup in `always` unconditional by construction
+# instead of by luck. Removing an absent file is a no-op, so this stays
+# idempotent.
 - name: Install detected AUR packages with yay
-  when: missing_aur_packages | length > 0
   block:
     # Rollback: this grant is removed in the always block. It is limited to
     # pacman because yay itself must run unprivileged.
@@ -168,6 +192,7 @@
         group: root
         mode: "0440"
         validate: /usr/sbin/visudo -cf %s
+      when: missing_aur_packages | length > 0
 
     - name: >-
         Batch-install detected AUR packages: brave-bin, claude-code,
@@ -195,8 +220,15 @@
       register: aur_batch_install
       changed_when: aur_batch_install.rc == 0
       failed_when: false
+      when: missing_aur_packages | length > 0
 
-    - name: Retry each AUR package after a failed batch
+    # One batch failure fails the whole yay invocation, so every missing package
+    # is retried alone to find out which ones are actually broken. The argv is
+    # the same list the batch uses, so a retry is the same operation in
+    # isolation. `failed_when: false` also suppresses this loop's own "ran out
+    # of retries" failure, which is what lets an unbuildable package leave the
+    # task `ok` and be classified below instead of aborting the play.
+    - name: Retry each AUR package individually after a failed batch
       ansible.builtin.command:
         argv: "{{ aur_yay_install_argv + [item] }}"
       become_user: "{{ admin_user }}"
@@ -212,45 +244,76 @@
       loop_control:
         label: "{{ item }}"
       register: aur_individual_install
-      changed_when: aur_individual_install.rc == 0
+      # `| default(1)` matters: a module-level failure (missing yay, lost
+      # become) returns no rc at all, and a bare `.rc` reference would raise a
+      # conditional error and divert the run into the rescue path instead of
+      # letting the classification below name the package and the reason.
+      until: aur_individual_install.rc | default(1) == 0
+      retries: "{{ aur_install_retries | int }}"
+      delay: "{{ aur_install_retry_delay | int }}"
+      changed_when: aur_individual_install.rc | default(1) == 0
       failed_when: false
-      when: aur_batch_install.rc != 0
+      when: aur_batch_install.rc | default(0) != 0
 
-    - name: Record AUR packages that still failed after individual retries
-      ansible.builtin.set_fact:
-        aur_failed_packages: >-
+    # A skipped loop item carries no `rc`, so the shape filters drop it. Whether
+    # `attempts` reached the retry budget is what separates "yay tried this the
+    # agreed number of times and it still will not build" (UPSTREAM_BROKEN) from
+    # "something stopped us before those attempts finished" (RETRYABLE_FAILURE).
+    - name: Classify every requested AUR package into one outcome
+      vars:
+        aur_attempted: >-
           {{ aur_individual_install.results | default([])
+             | rejectattr('skipped', 'defined') | list }}
+        aur_retry_succeeded: >-
+          {{ aur_attempted | selectattr('rc', 'defined')
+             | selectattr('rc', 'eq', 0) | map(attribute='item') | list }}
+        aur_retry_exhausted: >-
+          {{ aur_attempted | selectattr('rc', 'defined')
              | selectattr('rc', 'ne', 0)
-             | map(attribute='item')
-             | list }}
-      when: aur_batch_install.rc != 0
+             | selectattr('attempts', 'defined')
+             | selectattr('attempts', 'ge', aur_install_retries | int)
+             | map(attribute='item') | list }}
+      ansible.builtin.set_fact:
+        aur_installed_packages: >-
+          {{ missing_aur_packages if (aur_batch_install.rc | default(1)) == 0
+             else aur_retry_succeeded }}
+        aur_skipped_packages: "{{ aur_retry_exhausted }}"
+        aur_retryable_failed_packages: >-
+          {{ aur_attempted | map(attribute='item') | list
+             | difference(aur_retry_succeeded)
+             | difference(aur_retry_exhausted) }}
 
-    - name: Assert all requested AUR packages installed
+    # Deliberately asserts against the retryable list only. UPSTREAM_BROKEN
+    # packages are reported and skipped after this block, because no change here
+    # can make a broken PKGBUILD build and the rest of provisioning is unrelated.
+    - name: Assert no AUR package failed before its retries were spent
       ansible.builtin.assert:
         that:
-          - aur_batch_install.rc == 0 or (aur_failed_packages | default([]) | length == 0)
+          - aur_retryable_failed_packages | length == 0
         fail_msg: >-
-          yay batch installation failed with rc={{ aur_batch_install.rc }} and
-          individual retries still failed for:
-          {{ aur_failed_packages | default([]) | join(', ') }}.
+          yay never finished {{ aur_install_retries }} attempts for:
+          {{ aur_retryable_failed_packages | join(', ') }}. That points at this
+          host or the controller rather than upstream AUR breakage, so
+          provisioning stopped instead of skipping the packages. The temporary
+          pacman sudoers rule has still been removed.
 
   rescue:
-    - name: Report the failed AUR installation before cleanup
+    - name: Report the unexpected AUR failure before cleanup
       ansible.builtin.debug:
         msg: >-
-          {{ 'yay batch installation failed with rc=' ~ aur_batch_install.rc ~
-             '; individual retries still failed for: ' ~
-             (aur_failed_packages | join(', ')) ~ '.'
-             if (aur_failed_packages | default([]) | length > 0)
-             else 'The AUR installation block encountered an unexpected Ansible failure.' }}
+          The AUR installation block failed outside the three-outcome
+          classification: {{ ansible_failed_result.msg | default('no message') }}
+          Batch rc={{ aur_batch_install.rc | default('not reached') }},
+          retryable={{ aur_retryable_failed_packages | default([]) | join(', ') | default('none', true) }},
+          skipped={{ aur_skipped_packages | default([]) | join(', ') | default('none', true) }}.
           The temporary pacman sudoers rule will still be removed.
 
-    - name: Stop after a failed AUR installation
+    - name: Stop after an unexpected AUR installation failure
       ansible.builtin.fail:
         msg: >-
-          {{ 'AUR packages still failing after individual retries: ' ~
-             (aur_failed_packages | join(', ')) ~ '.'
-             if (aur_failed_packages | default([]) | length > 0)
+          {{ 'AUR packages failed before their retries were spent: ' ~
+             (aur_retryable_failed_packages | join(', ')) ~ '.'
+             if (aur_retryable_failed_packages | default([]) | length > 0)
              else 'AUR installation did not complete due to an Ansible module error.' }}
   always:
     # Rollback: remove the temporary privilege immediately, including on error.
@@ -258,6 +321,36 @@
       ansible.builtin.file:
         path: "/etc/sudoers.d/{{ admin_user }}-yay"
         state: absent
+
+# Runs after the block so the temporary privilege is already gone before the run
+# either reports or stops on skipped packages.
+- name: Summarise the AUR installation outcomes
+  ansible.builtin.debug:
+    msg:
+      installed_this_run: "{{ aur_installed_packages | sort }}"
+      already_present: "{{ aur_packages | difference(missing_aur_packages) | sort }}"
+      skipped_upstream_broken: "{{ aur_skipped_packages | sort }}"
+      failed_before_retries_were_spent: "{{ aur_retryable_failed_packages | sort }}"
+
+- name: Report the skipped AUR packages so nothing is silently missing
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['*** ' ~ (aur_skipped_packages | length) ~ ' AUR PACKAGE(S) SKIPPED - PROVISIONING CONTINUED WITHOUT THEM ***']
+         + (aur_skipped_packages | map('regex_replace', '^(.+)$', '  \1: retries exhausted (' ~ (aur_install_retries | int) ~ ' failed yay attempts); the PKGBUILD does not build on this host. Install it later with: yay -S \1') | list)
+         + ['Every other requested AUR package is installed. Re-run this role once upstream is fixed, or set aur_fail_hard=true to make this fatal instead.'] }}
+  when: aur_skipped_packages | length > 0
+
+- name: Stop when aur_fail_hard requires every requested AUR package
+  ansible.builtin.fail:
+    msg: >-
+      aur_fail_hard is set and these AUR packages did not install after
+      {{ aur_install_retries }} attempts each:
+      {{ aur_skipped_packages | join(', ') }}. Run `yay -S <package>` by hand to
+      see the upstream build error, or leave aur_fail_hard at its default of
+      false to provision without them.
+  when:
+    - aur_fail_hard | bool
+    - aur_skipped_packages | length > 0
 
 - name: Clone Oh My Zsh as documented by the dotfiles repository
   ansible.builtin.git:

@@ -1,0 +1,448 @@
+---
+# Two jobs here, both of which end up regenerating grub.cfg: silencing the boot
+# console, and installing the GRUB menu theme. The regeneration is shared at the
+# bottom so a run that changes both only rebuilds grub.cfg once.
+#
+# This host boots a unified kernel image: /etc/mkinitcpio.d/linux.preset sets
+# default_uki=/boot/EFI/Linux/arch-linux.efi, and the running /proc/cmdline
+# matches /etc/kernel/cmdline rather than GRUB_CMDLINE_LINUX_DEFAULT. That is
+# why /etc/default/grub already carried `quiet` while the boot console stayed
+# verbose: the UKI bakes its cmdline in at build time, so editing GRUB alone
+# changes nothing. Both sources are therefore configured, and each is only
+# touched when it exists.
+
+# Detected outside both blocks below, because the quiet cmdline and the theme
+# both need to know whether this host has a GRUB to configure.
+- name: Check for a GRUB default configuration
+  ansible.builtin.stat:
+    path: "{{ boot_grub_default_path }}"
+  register: boot_grub_default_stat
+
+- name: Check whether grub-mkconfig is installed
+  ansible.builtin.stat:
+    path: "{{ boot_grub_mkconfig_path }}"
+  register: boot_grub_mkconfig_stat
+
+- name: Note whether GRUB is present and configurable
+  ansible.builtin.set_fact:
+    boot_grub_present: >-
+      {{ boot_grub_default_stat.stat.exists and boot_grub_mkconfig_stat.stat.exists }}
+
+- name: Silence the boot console
+  when: boot_quiet | bool
+  block:
+    - name: Build the pattern that matches a managed kernel parameter key
+      ansible.builtin.set_fact:
+        # Matches "quiet", "loglevel=..." and so on, so a stale value such as
+        # loglevel=7 is replaced rather than duplicated. Dots are escaped so
+        # they cannot match an unrelated key.
+        boot_managed_key_pattern: >-
+          ^({{ boot_quiet_params | map('regex_replace', '=.*$', '')
+               | map('regex_escape') | join('|') }})(=|$)
+
+    # --- Unified kernel image path -------------------------------------------
+    - name: Check for a UKI kernel cmdline file
+      ansible.builtin.stat:
+        path: "{{ boot_uki_cmdline_path }}"
+      register: boot_uki_cmdline_stat
+
+    - name: Configure the UKI kernel cmdline
+      when: boot_uki_cmdline_stat.stat.exists
+      block:
+        - name: Read the current UKI kernel cmdline
+          ansible.builtin.slurp:
+            src: "{{ boot_uki_cmdline_path }}"
+          register: boot_uki_cmdline_current
+
+        # Rollback: restore the .bak file this task leaves behind, then rerun
+        # `mkinitcpio -P` to rebuild the UKI from it.
+        - name: Write the quiet UKI kernel cmdline
+          vars:
+            boot_uki_new_cmdline: >-
+              {{ (((boot_uki_cmdline_current.content | b64decode).split()
+                   | reject('match', boot_managed_key_pattern) | list)
+                  + boot_quiet_params) | join(' ') }}
+          ansible.builtin.copy:
+            dest: "{{ boot_uki_cmdline_path }}"
+            # Quoted scalar, not a folded one: YAML turns \n here into a real
+            # newline, whereas a folded scalar would write a literal backslash-n.
+            # The composition ignores surrounding whitespace, so the trailing
+            # newline does not affect idempotency.
+            content: "{{ boot_uki_new_cmdline }}\n"
+            owner: root
+            group: root
+            mode: "0644"
+            backup: true
+          register: boot_uki_cmdline_write
+
+        # The cmdline lives inside the UKI, so the file above has no effect
+        # until the image is rebuilt. If this fails the previous UKI is still
+        # in place and the host still boots, just without the new parameters.
+        - name: Rebuild the unified kernel image with the new cmdline
+          ansible.builtin.command:
+            argv: [mkinitcpio, -P]
+          register: boot_mkinitcpio
+          changed_when: true
+          when: boot_uki_cmdline_write.changed
+
+    # --- GRUB path -----------------------------------------------------------
+    # Kept in step with the UKI even though the UKI is what boots today, so a
+    # host that is later switched back to booting GRUB menu entries stays quiet.
+    - name: Configure the GRUB kernel cmdline
+      when: boot_grub_present
+      block:
+        - name: Read the current GRUB default configuration
+          ansible.builtin.slurp:
+            src: "{{ boot_grub_default_path }}"
+          register: boot_grub_default_current
+
+        - name: Set the quiet parameters in GRUB_CMDLINE_LINUX_DEFAULT
+          ansible.builtin.lineinfile:
+            path: "{{ boot_grub_default_path }}"
+            regexp: ^GRUB_CMDLINE_LINUX_DEFAULT=
+            line: >-
+              GRUB_CMDLINE_LINUX_DEFAULT="{{
+                (((boot_grub_default_current.content | b64decode
+                   | regex_search('^GRUB_CMDLINE_LINUX_DEFAULT="([^"]*)"',
+                                  '\1', multiline=True)
+                   | first | default('')).split()
+                  | reject('match', boot_managed_key_pattern) | list)
+                 + boot_quiet_params) | join(' ')
+              }}"
+            state: present
+            owner: root
+            group: root
+            mode: "0644"
+            backup: true
+          register: boot_grub_cmdline_write
+
+# --- GRUB menu theme --------------------------------------------------------
+# Reproduces what upstream's interactive install.sh does, minus its edits to
+# GRUB_CMDLINE_LINUX_DEFAULT and GRUB_TIMEOUT. See the notes in defaults.
+- name: Install the GRUB menu theme
+  when:
+    - boot_grub_theme_enabled | bool
+    - boot_grub_present
+  block:
+    - name: Require a resolution the theme ships files for
+      ansible.builtin.assert:
+        that:
+          - boot_grub_theme_resolution in boot_grub_theme_variants
+        fail_msg: >-
+          boot_grub_theme_resolution is {{ boot_grub_theme_resolution }}, but
+          the theme only ships files for
+          {{ boot_grub_theme_variants.keys() | list | join(' and ') }}.
+
+    - name: Resolve the theme paths for the selected resolution
+      ansible.builtin.set_fact:
+        boot_grub_theme_variant: "{{ boot_grub_theme_variants[boot_grub_theme_resolution] }}"
+        boot_grub_theme_dir: "{{ boot_grub_themes_dir }}/{{ boot_grub_theme_name }}"
+
+    - name: Create the user build directory
+      ansible.builtin.file:
+        path: "{{ admin_home }}/builds"
+        state: directory
+        owner: "{{ admin_user }}"
+        group: "{{ admin_user }}"
+        mode: "0755"
+
+    - name: Clone the GRUB theme repository as liam
+      ansible.builtin.git:
+        repo: "{{ boot_grub_theme_repo_url }}"
+        dest: "{{ boot_grub_theme_repo_path }}"
+        version: "{{ boot_grub_theme_repo_version }}"
+        depth: 1
+        update: true
+        force: false
+      become_user: "{{ admin_user }}"
+
+    # Everything below writes to the EFI system partition, which also holds the
+    # unified kernel images. Running it out of space breaks the next kernel
+    # upgrade, so refuse rather than half-fill it.
+    - name: Confirm the boot filesystem has room for the theme
+      vars:
+        boot_target_mount: >-
+          {{ ((ansible_facts.mounts | default([]) | selectattr('mount', 'eq', '/boot') | list)
+              or (ansible_facts.mounts | default([]) | selectattr('mount', 'eq', '/') | list)
+              or [{}]) | first }}
+      ansible.builtin.assert:
+        that:
+          - (boot_target_mount.size_available | int) > (boot_min_free_boot_mb | int * 1024 * 1024)
+        fail_msg: >-
+          {{ boot_target_mount.mount | default('the boot filesystem') }} has only
+          {{ ((boot_target_mount.size_available | default(0) | int) / 1024 / 1024) | round(1) }} MB
+          free, below the {{ boot_min_free_boot_mb }} MB this role insists on
+          before copying theme assets onto it. Free space there, or lower
+          boot_min_free_boot_mb if you are sure. Nothing has been copied.
+      when: boot_target_mount.size_available is defined
+
+    # The installed background is a copy of the resolution-specific source, so
+    # comparing the two checksums answers both "is it installed" and "is it the
+    # resolution currently selected" in one go.
+    - name: Read the checksum of the installed theme background
+      ansible.builtin.stat:
+        path: "{{ boot_grub_theme_dir }}/background.png"
+        checksum_algorithm: sha1
+      register: boot_grub_theme_installed_bg
+
+    - name: Read the checksum of the source background for this resolution
+      ansible.builtin.stat:
+        path: "{{ boot_grub_theme_repo_path }}/frieren-theme/{{ boot_grub_theme_variant.background }}"
+        checksum_algorithm: sha1
+      register: boot_grub_theme_source_bg
+
+    - name: Require the selected theme files to exist upstream
+      ansible.builtin.assert:
+        that:
+          - boot_grub_theme_source_bg.stat.exists
+        fail_msg: >-
+          {{ boot_grub_theme_variant.background }} is missing from
+          {{ boot_grub_theme_repo_path }}/frieren-theme. Upstream may have
+          renamed its resolution variants; check boot_grub_theme_variants.
+
+    - name: Deploy the theme files
+      when: >-
+        (boot_grub_theme_installed_bg.stat.checksum | default(''))
+        != boot_grub_theme_source_bg.stat.checksum
+      block:
+        # No mode or owner on anything under /boot: vfat cannot represent them,
+        # and asking makes the module fail rather than be ignored.
+        - name: Ensure the GRUB themes directory exists
+          ansible.builtin.file:
+            path: "{{ boot_grub_themes_dir }}"
+            state: directory
+
+        - name: Remove any previous copy of the theme
+          ansible.builtin.file:
+            path: "{{ boot_grub_theme_dir }}"
+            state: absent
+
+        # Plain `cp -r`, as upstream uses, rather than the copy module: copying
+        # a tree of new files onto vfat through the module would hit the chmod
+        # in atomic_move's create path, and cp without -p never chmods.
+        - name: Copy the theme onto the boot filesystem
+          ansible.builtin.command:
+            argv:
+              - cp
+              - -r
+              - "{{ boot_grub_theme_repo_path }}/frieren-theme"
+              - "{{ boot_grub_theme_dir }}"
+          changed_when: true
+
+        - name: Select the theme.txt and background for this resolution
+          ansible.builtin.command:
+            argv:
+              - cp
+              - "{{ boot_grub_theme_dir }}/{{ item.src }}"
+              - "{{ boot_grub_theme_dir }}/{{ item.dest }}"
+          loop:
+            - src: "{{ boot_grub_theme_variant.theme }}"
+              dest: theme.txt
+            - src: "{{ boot_grub_theme_variant.background }}"
+              dest: background.png
+          loop_control:
+            label: "{{ item.src }} -> {{ item.dest }}"
+          changed_when: true
+
+        - name: Find the resolution variants that are now redundant
+          ansible.builtin.find:
+            paths: "{{ boot_grub_theme_dir }}"
+            patterns: ["theme_*.txt", "background_*.png"]
+            file_type: file
+          register: boot_grub_theme_variant_files
+
+        - name: Remove the redundant resolution variants
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop: "{{ boot_grub_theme_variant_files.files | map(attribute='path') | list }}"
+          loop_control:
+            label: "{{ item | basename }}"
+
+        - name: Prune fonts the installed theme does not reference
+          when: boot_grub_theme_prune_unused_fonts | bool
+          block:
+            - name: Read the installed theme.txt
+              ansible.builtin.slurp:
+                src: "{{ boot_grub_theme_dir }}/theme.txt"
+              register: boot_grub_theme_txt
+
+            - name: List the fonts the theme references
+              ansible.builtin.set_fact:
+                # Only the fonts theme.txt actually names, read from the file so
+                # this stays right if upstream changes them. Commented-out lines
+                # are included on purpose: harmless, and cheaper than parsing.
+                boot_grub_theme_wanted_fonts: >-
+                  {{ (boot_grub_theme_txt.content | b64decode
+                      | regex_findall('fonts/([-\w.]+\.pf2)')) | unique | list }}
+
+            - name: Find the fonts shipped with the theme
+              ansible.builtin.find:
+                paths: "{{ boot_grub_theme_dir }}/fonts"
+                patterns: ["*.pf2"]
+                file_type: file
+              register: boot_grub_theme_shipped_fonts
+
+            # Skipped when nothing was matched, so a theme.txt this regex does
+            # not understand leaves every font in place instead of stripping all
+            # of them and silently losing the theme's typography.
+            - name: Remove the unreferenced fonts
+              ansible.builtin.file:
+                path: "{{ item }}"
+                state: absent
+              loop: >-
+                {{ boot_grub_theme_shipped_fonts.files | map(attribute='path') | list
+                   | reject('regex', '/(' ~ (boot_grub_theme_wanted_fonts
+                                             | map('regex_escape') | join('|')) ~ ')$')
+                   | list }}
+              loop_control:
+                label: "{{ item | basename }}"
+              when: boot_grub_theme_wanted_fonts | length > 0
+
+    # Regenerated every run from whatever fonts survive, so it cannot drift out
+    # of step with the directory it points at.
+    - name: Find the fonts now installed with the theme
+      ansible.builtin.find:
+        paths: "{{ boot_grub_theme_dir }}/fonts"
+        patterns: ["*.pf2"]
+        file_type: file
+      register: boot_grub_theme_final_fonts
+
+    - name: Install the GRUB font-loading script
+      vars:
+        boot_grub_theme_fonts: >-
+          {{ boot_grub_theme_final_fonts.files | map(attribute='path')
+             | map('basename') | sort | list }}
+      ansible.builtin.template:
+        src: 09_loadfonts.j2
+        dest: "{{ boot_grub_loadfonts_path }}"
+        owner: root
+        group: root
+        mode: "0755"
+      diff: true
+      register: boot_grub_loadfonts
+
+    # Deliberately not GRUB_CMDLINE_LINUX_DEFAULT, which the quiet-boot block
+    # above owns, and not GRUB_TIMEOUT, which is the operator's choice. The
+    # regexp also matches the commented-out defaults Arch ships.
+    - name: Point GRUB at the theme
+      ansible.builtin.lineinfile:
+        path: "{{ boot_grub_default_path }}"
+        regexp: "^#?{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        state: present
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      loop:
+        - key: GRUB_THEME
+          value: '"{{ boot_grub_theme_dir }}/theme.txt"'
+        - key: GRUB_GFXMODE
+          value: "{{ boot_grub_theme_resolution }}"
+        # The theme is drawn by the graphical terminal; without gfxterm GRUB
+        # renders a plain text menu and ignores GRUB_THEME entirely.
+        - key: GRUB_GFXPAYLOAD_LINUX
+          value: keep
+        - key: GRUB_TERMINAL_OUTPUT
+          value: '"gfxterm"'
+        # A hidden menu would never show the theme.
+        - key: GRUB_TIMEOUT_STYLE
+          value: menu
+      loop_control:
+        label: "{{ item.key }}"
+      register: boot_grub_theme_keys
+
+# --- Shared grub.cfg regeneration -------------------------------------------
+# Generated to a candidate path and syntax-checked before it replaces the live
+# grub.cfg, so a bad generation cannot leave an unbootable configuration behind.
+# Rollback: copy boot_grub_cfg_backup_path back over grub.cfg, or just rerun
+# `grub-mkconfig -o /boot/grub/grub.cfg`, which regenerates it from the
+# /etc/default/grub that this role also backs up.
+- name: Regenerate and install grub.cfg
+  when:
+    - boot_grub_present
+    - >-
+      (boot_grub_cmdline_write.changed | default(false))
+      or (boot_grub_loadfonts.changed | default(false))
+      or (boot_grub_theme_keys.changed | default(false))
+      or (boot_grub_theme_installed_bg.stat.checksum | default('none'))
+         != (boot_grub_theme_source_bg.stat.checksum | default('none'))
+  block:
+    # /boot is a vfat EFI system partition mounted fmask=0077. vfat rejects the
+    # colons in Ansible's timestamped backup names with EINVAL, and it cannot
+    # represent an arbitrary mode, so nothing below asks it to: the backup goes
+    # to the root filesystem, and no owner, group or mode is requested for
+    # anything under /boot.
+    - name: Ensure the boot backup directory exists
+      ansible.builtin.file:
+        path: "{{ boot_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Check for an existing grub.cfg to back up
+      ansible.builtin.stat:
+        path: "{{ boot_grub_cfg_path }}"
+      register: boot_grub_cfg_stat
+
+    # Source is on vfat, destination is on the root filesystem, so the
+    # ownership and mode here apply to a filesystem that supports them.
+    - name: Back up the current grub.cfg outside /boot
+      ansible.builtin.copy:
+        src: "{{ boot_grub_cfg_path }}"
+        dest: "{{ boot_grub_cfg_backup_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      when: boot_grub_cfg_stat.stat.exists
+
+    - name: Generate a candidate grub.cfg
+      ansible.builtin.command:
+        argv: [grub-mkconfig, -o, "{{ boot_grub_cfg_path }}.ansible-new"]
+      register: boot_grub_mkconfig
+      changed_when: true
+
+    - name: Syntax-check the candidate grub.cfg
+      ansible.builtin.command:
+        argv: [grub-script-check, "{{ boot_grub_cfg_path }}.ansible-new"]
+      changed_when: false
+
+    # No owner, group, mode or backup here. With remote_src the copy module
+    # passes keep_dest_attrs=False and creates its temporary file in the
+    # destination directory, so replacing an existing grub.cfg is a plain
+    # write-and-rename inside /boot with no chown or chmod, which is the only
+    # thing vfat will accept. The mount's fmask decides the mode, the previous
+    # file is saved outside /boot above, and the candidate was syntax-checked.
+    # (If grub.cfg were ever missing entirely, atomic_move's "creating" path
+    # would chmod and fail on vfat; that only happens on a host with no GRUB
+    # config at all.)
+    - name: Install the validated grub.cfg  # noqa: risky-file-permissions
+      ansible.builtin.copy:
+        src: "{{ boot_grub_cfg_path }}.ansible-new"
+        dest: "{{ boot_grub_cfg_path }}"
+        remote_src: true
+  always:
+    - name: Remove the candidate grub.cfg
+      ansible.builtin.file:
+        path: "{{ boot_grub_cfg_path }}.ansible-new"
+        state: absent
+
+# --- Report -----------------------------------------------------------------
+- name: Report what the next boot will look like
+  ansible.builtin.debug:
+    msg: >-
+      {{ [('Quiet boot parameters: ' ~ (boot_quiet_params | join(' '))) if boot_quiet | bool else 'Quiet boot is disabled (boot_quiet=false).']
+         + [('UKI cmdline updated at ' ~ boot_uki_cmdline_path ~ '; the unified kernel image was rebuilt.')
+            if (boot_uki_cmdline_write.changed | default(false))
+            else (('UKI cmdline at ' ~ boot_uki_cmdline_path ~ ' was already correct; nothing rebuilt.')
+                  if (boot_uki_cmdline_stat.stat.exists | default(false))
+                  else ('No UKI cmdline at ' ~ boot_uki_cmdline_path ~ '; this host does not boot a unified kernel image.'))]
+         + [('GRUB theme ' ~ boot_grub_theme_name ~ ' installed at ' ~ (boot_grub_theme_dir | default('-')) ~ ' for ' ~ boot_grub_theme_resolution ~ '.')
+            if (boot_grub_theme_enabled | bool and boot_grub_present)
+            else 'GRUB theme not managed on this host.']
+         + [('grub.cfg was regenerated.') if (boot_grub_mkconfig.changed | default(false))
+            else 'grub.cfg was already up to date.']
+         + ['These changes only take effect on the next boot.'] }}

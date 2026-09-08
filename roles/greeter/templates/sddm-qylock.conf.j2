@@ -1,0 +1,13 @@
+# Managed by Ansible (roles/greeter). Local edits are overwritten on the next
+# run. This is the same path qylock's own sddm.sh writes, so running that
+# script by hand replaces this file rather than silently shadowing it.
+[Theme]
+Current={{ greeter_sddm_theme_install_name }}
+
+[General]
+DisplayServer={{ sddm_display_server }}
+{% if sddm_display_server == 'wayland' and sddm_wayland_compositor_command | length > 0 %}
+
+[Wayland]
+CompositorCommand={{ sddm_wayland_compositor_command }}
+{% endif %}

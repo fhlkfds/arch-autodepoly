@@ -27,6 +27,17 @@ ssh_validation_host: >-
 ssh_validation_identity_file: ""
 ssh_allow_agent_forwarding: false
 
+# This workstation runs no SSH server in its finished state. The ssh role still
+# installs and validates the hardened sshd configuration during a run, and the
+# final task of the final play then stops and disables sshd, so nothing listens
+# on the SSH port afterwards.
+# Consequences of the default: a remote `ansible-playbook` run still works once,
+# because it travels over the sshd that is already up, but it cannot open a new
+# connection afterwards. Re-enable at the console with
+# `systemctl enable --now sshd`, or run with `-e ssh_enabled=true` to leave sshd
+# running and keep its UFW allowance in place.
+ssh_enabled: false
+
 workstation_groups:
   - wheel
   - video
@@ -87,9 +98,26 @@ official_packages:
   - slurp
   - hyprpicker
   - gpu-screen-recorder
-  - greetd
-  - greetd-regreet
-  - greetd-tuigreet
+  # Login screen: SDDM with a qylock theme. greetd, greetd-regreet and
+  # greetd-tuigreet were dropped here when the login manager was switched, but
+  # they are deliberately not force-removed from hosts that already have them,
+  # so a working greetd remains available to fall back to.
+  - sddm
+  # The greeter runs under Wayland (sddm_display_server), which needs a
+  # compositor to host it; weston is the one SDDM drives by default.
+  - weston
+  # qylock's documented dependencies. Core carries the QML runtime the themes
+  # are written in; the multimedia and GStreamer packages are what let a theme
+  # play a video background, which the selected theme does.
+  - qt6-declarative
+  - qt6-5compat
+  - qt6-svg
+  - qt6-multimedia
+  - qt6-multimedia-ffmpeg
+  - gst-plugins-base
+  - gst-plugins-good
+  - gst-plugins-bad
+  - gst-plugins-ugly
   - satty
   - ffmpeg
   - imagemagick
@@ -203,10 +231,45 @@ stow_key_links:
   - target: "{{ admin_home }}/.config/systemd/user/hypr-monitor-watch.service"
     source: "{{ dotfiles_repo_path }}/systemd/.config/systemd/user/hypr-monitor-watch.service"
 
-# Only used to bootstrap the login screen theme on a fresh box that has never
-# run `theme set`; an existing theme choice always takes priority.
+# Only used to bootstrap the dotfiles theme on a fresh box that has never run
+# `theme set`; an existing theme choice always takes priority. This no longer
+# feeds the login screen, which is themed by sddm_theme below, but the greeter
+# role still runs `theme set` because nothing else in the playbook does, and
+# skipping it would leave a fresh box with no theme rendered at all.
 greeter_theme_slug: tokyo-night
-greeter_service_user: greeter
+
+# Login screen: https://github.com/Darkkal44/qylock (GPL-3.0), a collection of
+# SDDM themes. Its installer is interactive (fzf pickers and read prompts), so
+# the greeter role does what the script does instead of running it: copy
+# themes/<name> into /usr/share/sddm/themes/ and point SDDM at it.
+qylock_repo_url: https://github.com/Darkkal44/qylock.git
+qylock_repo_version: main
+qylock_repo_path: "{{ admin_home }}/builds/qylock"
+
+# The upstream repository is about 1.1 GB because every theme carries its own
+# video and image assets, so the role checks out only the selected theme with a
+# sparse, blobless clone. That is roughly 25 MB on disk for this theme.
+# Any directory name under the repository's themes/ works here, including a
+# nested variant such as clockwork/orbital.
+sddm_theme: star-rail
+
+# Honkai: Star Rail expects DIN Next, which qylock cannot ship for copyright
+# reasons, so no font/ directory exists for it upstream. The theme still works
+# with a fallback font; the role prints where to drop the file to get the
+# intended look. See the font table in qylock's README for other themes.
+sddm_theme_font_note: DIN Next, saved as font.ttf
+
+sddm_themes_dir: /usr/share/sddm/themes
+# The same path qylock's own sddm.sh writes, so running that script by hand
+# replaces this file instead of silently shadowing it.
+sddm_conf_path: /etc/sddm.conf.d/theme.conf
+
+# x11 needs xorg-server installed; wayland needs a compositor (weston above).
+sddm_display_server: wayland
+
+# Left empty on purpose so SDDM uses the compositor command compiled into the
+# installed version, which is correct for that version. Set it only to override.
+sddm_wayland_compositor_command: ""
 
 oh_my_zsh_repo_url: https://github.com/ohmyzsh/ohmyzsh.git
 powerlevel10k_repo_url: https://github.com/romkatv/powerlevel10k.git
@@ -222,3 +285,16 @@ fail2ban_maxretry: 5
 # ufw_lan_rules:
 #   - { port: "1714:1764", proto: udp, from_ip: "192.168.1.0/24", comment: "KDE Connect LAN" }
 ufw_lan_rules: []
+
+# LocalSend's documented default port. TCP carries the file transfers and UDP
+# carries multicast peer discovery, so both are opened: with UDP closed the app
+# cannot find peers and every device has to be added by IP by hand.
+localsend_port: 53317
+
+# Deliberately restricted to the LAN ranges instead of any source address.
+# LocalSend authenticates nothing beyond an in-app confirmation prompt, so the
+# listener should not be reachable from untrusted networks the host joins.
+# Set to [] to close the port again.
+localsend_source_ranges:
+  - 10.2.1.0/24
+  - 192.168.1.0/24

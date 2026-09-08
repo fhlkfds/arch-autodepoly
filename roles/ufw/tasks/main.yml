@@ -12,6 +12,10 @@
     name: ufw
     state: present
 
+# This allowance is added even when ssh_enabled is false, because this role and
+# the verification role both open a fresh SSH connection from the controller to
+# prove the firewall did not lock the host out. The final play deletes the rule
+# again when ssh_enabled is false, once nothing else needs SSH.
 - name: Rate-limit the configured SSH port before enabling UFW
   community.general.ufw:
     rule: limit
@@ -29,6 +33,22 @@
   loop: "{{ ufw_lan_rules }}"
   loop_control:
     label: "{{ item.from_ip }} -> {{ item.port }}/{{ item.proto }}"
+
+# LocalSend needs both protocols on the same port: TCP for the transfer itself
+# and UDP for the multicast discovery that finds peers. Scoped to
+# localsend_source_ranges so the listener is not exposed on untrusted networks.
+# Rollback: set localsend_source_ranges to [] and delete the rules by hand with
+# `ufw delete allow from <range> to any port 53317 proto tcp` (and udp).
+- name: Allow LocalSend on the trusted LAN ranges
+  community.general.ufw:
+    rule: allow
+    port: "{{ localsend_port | string }}"
+    proto: "{{ item.1 }}"
+    from_ip: "{{ item.0 }}"
+    comment: "LocalSend LAN"
+  loop: "{{ localsend_source_ranges | product(['tcp', 'udp']) | list }}"
+  loop_control:
+    label: "{{ item.0 }} -> {{ localsend_port }}/{{ item.1 }}"
 
 - name: Set the default incoming policy to deny
   community.general.ufw:
@@ -58,11 +78,18 @@
   register: ufw_status_output
   changed_when: false
 
-- name: Assert UFW is active and exposes the SSH port
+- name: Assert UFW is active and exposes the expected ports
   ansible.builtin.assert:
     that:
       - "'Status: active' in ufw_status_output.stdout"
       - (effective_ssh_port | string) in ufw_status_output.stdout
+      - >-
+        localsend_source_ranges | length == 0 or
+        (localsend_port | string) in ufw_status_output.stdout
+    fail_msg: >-
+      UFW is not active, or it is missing the SSH port
+      ({{ effective_ssh_port }}) or the LocalSend port ({{ localsend_port }}).
+      Current status: {{ ufw_status_output.stdout }}
 
 - name: Verify fresh SSH key authentication after enabling UFW
   ansible.builtin.command:

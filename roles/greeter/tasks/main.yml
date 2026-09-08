@@ -1,25 +1,34 @@
 ---
-# Wires up the themed greetd + regreet login screen documented in the
-# dotfiles repo (system/greetd/, greeter/.config/greeter/README.md). Runs
-# after packages (needs greetd-regreet and the greeter system user it
-# creates) and dotfiles (needs hypr + greeter stowed and the theme
-# generator available).
+# Sets up the login screen: SDDM showing a theme from qylock
+# (https://github.com/Darkkal44/qylock, GPL-3.0). Runs after packages (needs
+# sddm, weston and the Qt/GStreamer stack) and dotfiles (needs hypr and the
+# theme generator available).
+#
+# qylock ships sddm.sh to install a theme, but that script clears the screen,
+# offers an fzf picker and blocks on `read`, so it cannot be driven from
+# Ansible. The tasks below do exactly what it does at the end: copy
+# themes/<name> to /usr/share/sddm/themes/<name> and write a [Theme] Current
+# entry into /etc/sddm.conf.d/theme.conf.
+#
+# Rollback: set sddm_display_server and the theme back, or to return to greetd
+# run `systemctl disable sddm && systemctl enable greetd` and reboot. The
+# greetd packages are not removed from hosts that already have them.
 
 # The official hyprland package ships both hyprland.desktop (Exec=/usr/bin/
 # start-hyprland, what this repo's session actually uses) and
 # hyprland-uwsm.desktop, both registering DesktopNames=Hyprland with the same
-# display name to greeters. That ambiguity is what makes tuigreet/regreet
-# default to "Hyprland (uwsm-managed)" instead of the plain session. Nothing
-# in this repo or the dotfiles repo uses uwsm, so keep only the plain entry
-# visible. Renamed, not deleted, so it comes back cleanly if ever wanted; a
-# `hyprland` package upgrade can restore the original file, which is why this
-# runs every time rather than only once.
+# display name to greeters. That ambiguity is what makes a greeter default to
+# "Hyprland (uwsm-managed)" instead of the plain session. SDDM reads the same
+# /usr/share/wayland-sessions directory greetd did, so this still applies.
+# Renamed, not deleted, so it comes back cleanly if ever wanted; a `hyprland`
+# package upgrade can restore the original file, which is why this runs every
+# time rather than only once.
 - name: Check whether the uwsm-managed Hyprland session entry is present
   ansible.builtin.stat:
     path: /usr/share/wayland-sessions/hyprland-uwsm.desktop
   register: greeter_uwsm_session
 
-- name: Hide the uwsm-managed Hyprland session so greeters default to plain Hyprland
+- name: Hide the uwsm-managed Hyprland session so the greeter defaults to plain Hyprland
   ansible.builtin.command:
     argv:
       - mv
@@ -28,6 +37,11 @@
       - /usr/share/wayland-sessions/hyprland-uwsm.desktop.disabled
   when: greeter_uwsm_session.stat.exists
 
+# SDDM does not read the dotfiles theme, but `theme set` is what renders the
+# rest of the desktop's themed files, and nothing else in this playbook runs
+# it. Keeping it here is what stops a fresh box from ending up with no theme
+# rendered at all. regreet.toml is still produced by the stowed greeter package
+# and is used purely as the "has a theme ever been rendered" marker.
 - name: Read the currently active theme slug, if any
   ansible.builtin.command:
     argv: ["{{ admin_home }}/.local/bin/theme", current]
@@ -38,14 +52,14 @@
   changed_when: false
   failed_when: false
 
-- name: Check whether the themed greeter files have been rendered yet
+- name: Check whether the themed dotfiles have been rendered yet
   ansible.builtin.stat:
     path: "{{ admin_home }}/.config/greeter/regreet.toml"
   register: greeter_theme_files
 
 # Preserves an existing theme choice; only falls back to greeter_theme_slug
 # on a fresh box where `theme set` has never run.
-- name: Render the themed greeter files
+- name: Render the themed dotfiles
   ansible.builtin.command:
     argv:
       - "{{ admin_home }}/.local/bin/theme"
@@ -56,115 +70,183 @@
     HOME: "{{ admin_home }}"
   when: not greeter_theme_files.stat.exists
 
-- name: Install the themed greeter stylesheet into /etc/greetd
-  ansible.builtin.copy:
-    src: "{{ admin_home }}/.config/greeter/greeter.css"
-    dest: /etc/greetd/regreet.css
-    remote_src: true
-    owner: root
-    group: root
-    mode: "0644"
-  register: greeter_css_deployed
-
-- name: Install the themed greeter config into /etc/greetd
-  ansible.builtin.copy:
-    src: "{{ admin_home }}/.config/greeter/regreet.toml"
-    dest: /etc/greetd/regreet.toml
-    remote_src: true
-    owner: root
-    group: root
-    mode: "0644"
-  register: greeter_toml_deployed
-
-# greetd runs the greeter's Hyprland instance as the dedicated `greeter`
-# system user, whose home is `/`, not liam's -- grant just enough ACL
-# traversal to reach the one stowed config file. Mirrors the manual
-# recipe in greeter/.config/greeter/README.md.
-- name: Grant the greeter system user traversal access through the home directory
-  ansible.posix.acl:
-    path: "{{ item }}"
-    entity: "{{ greeter_service_user }}"
-    etype: user
-    permissions: x
-    state: present
-  loop:
-    - "{{ admin_home }}"
-    - "{{ admin_home }}/.config"
-    - "{{ admin_home }}/.config/hypr"
-    - "{{ admin_home }}/.config/hypr/conf"
-
-- name: Grant the greeter system user read+execute on the greeter conf directory
-  ansible.posix.acl:
-    path: "{{ admin_home }}/.config/hypr/conf/greeter"
-    entity: "{{ greeter_service_user }}"
-    etype: user
-    permissions: rx
-    state: present
-
-- name: Grant the greeter system user read access to the greeter Hyprland config
-  ansible.posix.acl:
-    path: "{{ admin_home }}/.config/hypr/conf/greeter/hyprland-greeter.conf"
-    entity: "{{ greeter_service_user }}"
-    etype: user
-    permissions: r
-    state: present
-
-- name: Check for an existing greetd session config
-  ansible.builtin.stat:
-    path: /etc/greetd/config.toml
-  register: greeter_existing_config
-
-# force: false means "only copy if the destination is absent", so a backup
-# made on an earlier run is never clobbered -- same rule system/greetd/install.sh
-# uses in the dotfiles repo.
-- name: Preserve the pre-regreet greetd config on first deploy
-  ansible.builtin.copy:
-    src: /etc/greetd/config.toml
-    dest: /etc/greetd/config.toml.pre-regreet
-    remote_src: true
-    force: false
-    owner: root
-    group: root
-    mode: preserve
-  when: greeter_existing_config.stat.exists
-
-- name: Install the repository's greetd session config
-  ansible.builtin.copy:
-    src: "{{ dotfiles_repo_path }}/system/greetd/config.toml"
-    dest: /etc/greetd/config.toml
-    remote_src: true
-    owner: root
-    group: root
-    mode: "0644"
-  register: greeter_config_deployed
-
-- name: Note whether any greeter-facing file changed this run
+- name: Record the directory name the theme is installed under
   ansible.builtin.set_fact:
-    greeter_config_changed: >-
-      {{ greeter_config_deployed.changed
-         or greeter_css_deployed.changed
-         or greeter_toml_deployed.changed }}
+    # sddm_theme may be a nested variant such as clockwork/orbital, and upstream
+    # installs those under just the variant name.
+    greeter_sddm_theme_install_name: "{{ sddm_theme | basename }}"
 
-# state: started is a no-op when greetd is already running, so .changed here
-# means "greetd was not already running" -- i.e. this is the first time the
-# login screen is coming up, which is exactly when it is safe to start it
-# with the new config already in place.
-- name: Enable and start greetd as the display manager
-  ansible.builtin.systemd_service:
-    name: greetd.service
-    enabled: true
-    state: started
-  register: greeter_service
+- name: Create the user build directory
+  ansible.builtin.file:
+    path: "{{ admin_home }}/builds"
+    state: directory
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0755"
 
-- name: Warn that a live greeter needs a manual restart to pick up new config
+# Not the git module: it cannot do a blobless sparse clone, and a full clone of
+# this repository transfers about 1.1 GB of theme assets to fetch one theme.
+# Cloned once and not auto-updated, because these are static assets and a
+# refresh would recopy them; delete the directory to pick up upstream changes.
+# noqa is deliberate: `creates` below is what makes this idempotent, and a
+# changed_when here would override the module's own changed=False when creates
+# short-circuits the clone, reporting a change on every run.
+- name: Sparsely clone qylock as liam  # noqa: no-changed-when
+  ansible.builtin.command:
+    argv:
+      - git
+      - clone
+      - --depth
+      - "1"
+      - --filter=blob:none
+      - --sparse
+      - --branch
+      - "{{ qylock_repo_version }}"
+      - "{{ qylock_repo_url }}"
+      - "{{ qylock_repo_path }}"
+    creates: "{{ qylock_repo_path }}/.git"
+  become_user: "{{ admin_user }}"
+  environment:
+    HOME: "{{ admin_home }}"
+
+- name: Read which paths the sparse checkout currently includes
+  ansible.builtin.command:
+    argv: [git, sparse-checkout, list]
+    chdir: "{{ qylock_repo_path }}"
+  become_user: "{{ admin_user }}"
+  environment:
+    HOME: "{{ admin_home }}"
+  register: greeter_sparse_paths
+  changed_when: false
+  failed_when: false
+
+- name: Check out only the selected theme
+  ansible.builtin.command:
+    argv: [git, sparse-checkout, set, "themes/{{ sddm_theme }}"]
+    chdir: "{{ qylock_repo_path }}"
+  become_user: "{{ admin_user }}"
+  environment:
+    HOME: "{{ admin_home }}"
+  changed_when: true
+  when: (greeter_sparse_paths.stdout_lines | default([])) != ['themes/' ~ sddm_theme]
+
+- name: Confirm the selected theme exists in the checkout
+  ansible.builtin.stat:
+    path: "{{ qylock_repo_path }}/themes/{{ sddm_theme }}/metadata.desktop"
+  register: greeter_theme_source
+
+- name: Require a usable qylock theme before touching SDDM
+  ansible.builtin.assert:
+    that:
+      - greeter_theme_source.stat.exists
+    fail_msg: >-
+      No theme at {{ qylock_repo_path }}/themes/{{ sddm_theme }} with a
+      metadata.desktop. Set sddm_theme to a directory name that exists under
+      the repository's themes/ directory. SDDM has not been reconfigured.
+
+# qylock cannot ship some themes' fonts for copyright reasons, so the theme
+# simply falls back to a default font until the file is supplied by hand. This
+# only reports; a missing font is not an error.
+- name: Look for a bundled font in the selected theme
+  ansible.builtin.find:
+    paths: "{{ qylock_repo_path }}/themes/{{ sddm_theme }}/font"
+    patterns: ["*.ttf", "*.otf"]
+    file_type: file
+  register: greeter_theme_fonts
+  changed_when: false
+
+- name: Report that the selected theme has no font of its own
   ansible.builtin.debug:
     msg: >-
-      /etc/greetd/config.toml, regreet.css, or regreet.toml changed, and
-      greetd was already running before this play. Restarting it now could
-      kill an active login session on its VT, so this play does not do that
-      automatically. Apply the change at the next reboot, or run
-      `sudo systemctl restart greetd` yourself from a TTY you are not
-      currently using.
-  when:
-    - greeter_config_changed
-    - not greeter_service.changed
+      {{ ['The ' ~ sddm_theme ~ ' theme ships no font, which qylock cannot bundle for copyright reasons.']
+         + ['Expected font: ' ~ sddm_theme_font_note ~ '.']
+         + ['Drop it in ' ~ qylock_repo_path ~ '/themes/' ~ sddm_theme ~ '/font/ and rerun this role to get the intended look.']
+         + ['The login screen works without it, using a fallback font.'] }}
+  when: (greeter_theme_fonts.matched | default(0)) == 0
+
+- name: Ensure the system SDDM theme directory exists
+  ansible.builtin.file:
+    path: "{{ sddm_themes_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# A trailing slash on src copies the directory's contents, so the theme lands
+# at themes/<name>/ rather than themes/<name>/<name>/. The copy is
+# checksum-based, so an unchanged theme reports no change on later runs.
+- name: Install the qylock theme into the system SDDM theme directory
+  ansible.builtin.copy:
+    src: "{{ qylock_repo_path }}/themes/{{ sddm_theme }}/"
+    dest: "{{ sddm_themes_dir }}/{{ greeter_sddm_theme_install_name }}/"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+    directory_mode: "0755"
+  register: greeter_theme_installed
+
+- name: Ensure the SDDM drop-in configuration directory exists
+  ansible.builtin.file:
+    path: "{{ sddm_conf_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Point SDDM at the qylock theme and the configured display server
+  ansible.builtin.template:
+    src: sddm-qylock.conf.j2
+    dest: "{{ sddm_conf_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  diff: true
+  register: greeter_sddm_config
+
+# Read before anything is enabled or disabled: disabling greetd removes the
+# display-manager.service alias, and greetd is no longer in official_packages,
+# so on a fresh host its unit does not exist at all.
+- name: Read the current service state
+  ansible.builtin.service_facts:
+
+- name: Note whether a display manager is already driving a VT
+  ansible.builtin.set_fact:
+    greeter_dm_running: >-
+      {{ ((ansible_facts.services | default({})) | dict2items
+          | selectattr('key', 'in', ['greetd.service', 'sddm.service'])
+          | selectattr('value.state', 'eq', 'running')
+          | list | length) > 0 }}
+
+# greetd must give up the display-manager.service alias before sddm can claim
+# it; `systemctl enable sddm` fails outright while greetd still owns it.
+# Only the enablement changes here: greetd is deliberately not stopped, because
+# stopping a running display manager kills the graphical session on its VT.
+- name: Disable greetd so SDDM can take over the display-manager alias
+  ansible.builtin.systemd_service:
+    name: greetd.service
+    enabled: false
+  when: "'greetd.service' in (ansible_facts.services | default({}))"
+
+- name: Enable SDDM as the display manager
+  ansible.builtin.systemd_service:
+    name: sddm.service
+    enabled: true
+
+# Safe only when nothing is already driving a VT. If a display manager is up,
+# starting SDDM now would fight it for the console, so the switch waits for a
+# reboot.
+- name: Start SDDM now when no display manager is running yet
+  ansible.builtin.systemd_service:
+    name: sddm.service
+    state: started
+  when: not greeter_dm_running
+
+- name: Report that the switch to SDDM needs a reboot
+  ansible.builtin.debug:
+    msg: >-
+      A display manager was already running before this play, so SDDM has been
+      enabled but not started; restarting one now would kill the session on its
+      VT. Reboot to land on the {{ greeter_sddm_theme_install_name }} login screen.
+      greetd is already disabled, so it will not come back.
+  when: greeter_dm_running

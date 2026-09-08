@@ -20,8 +20,8 @@ rofi screensaver security swaync systemd windows Wallpapers wofi xdg zsh
 
 `docs`, `tests`, and `system` are explicitly excluded. `system` contains
 root-owned greetd and PAM examples, so this playbook does not Stow or install
-them. `Wallpapers` is unusual: its files land directly in `$HOME`, matching the
-upstream warning. Stow runs with `--no-folding`, which makes every managed file
+them; the login screen is SDDM rather than greetd in any case. `Wallpapers` is
+unusual: its files land directly in `$HOME`, matching the upstream warning. Stow runs with `--no-folding`, which makes every managed file
 an individually verifiable symlink.
 
 Before Stow runs, an existing target that does not already point into
@@ -141,15 +141,57 @@ connection, and only then runs Ansible fact gathering. This is required for a
 minimal Arch host where `/usr/bin/python3` does not exist yet. Check mode cannot
 avoid this bootstrap; use a real run with `--ask-become-pass`.
 
-Tags are `users`, `packages`, `docker`, `dotfiles`, `ssh`, `ufw`, `fail2ban`, and
-`verification`. The users role also carries `always`, because every other role
-depends on the account and group state. Avoid running `ufw` or `fail2ban` alone;
-they require the SSH role's discovered port and successful key check.
+Tags are `users`, `packages`, `boot`, `docker`, `dotfiles`, `greeter`, `ssh`,
+`ufw`, `fail2ban`, and `verification`. The users role also carries `always`,
+because every other role depends on the account and group state. Avoid running
+`ufw` or `fail2ban` alone; they require the SSH role's discovered port and
+successful key check.
 
-No desktop, NetworkManager, libvirt, greetd, user unit, or Wayland service is
-enabled. Stow may place unit files in the home directory, but the playbook does
-not activate them. Only `docker.service`, `sshd.service`, `ufw.service`, and
-`fail2ban.service` are enabled.
+No desktop, NetworkManager, libvirt, user unit, or Wayland service is enabled.
+Stow may place unit files in the home directory, but the playbook does not
+activate them. Only `docker.service`, `sddm.service`, `ufw.service`, and
+`fail2ban.service` are left enabled.
+
+The login screen is SDDM showing a theme from
+[qylock](https://github.com/Darkkal44/qylock) (GPL-3.0), selected with
+`sddm_theme`. qylock's `sddm.sh` is interactive, so the
+greeter role does what that script does rather than running it: copy
+`themes/<name>` into `/usr/share/sddm/themes/` and write `[Theme] Current` into
+`/etc/sddm.conf.d/theme.conf`. The upstream repository is about 1.1 GB because
+each theme carries its own video and image assets, so only the selected theme is
+fetched, with a blobless sparse checkout. Some themes expect a font that qylock
+cannot redistribute; the role reports where to drop it and the theme falls back
+to a default font until you do. `sddm_display_server` defaults to `wayland`,
+which is why `weston` is installed to host the greeter; set it to `x11` and add
+`xorg-server` if a theme misbehaves under Wayland.
+
+greetd, greetd-regreet and greetd-tuigreet were dropped from `official_packages`
+when the login manager was switched, but they are not force-removed, so a host
+that already has them keeps a working fallback: `systemctl disable sddm &&
+systemctl enable greetd`, then reboot. The greeter role disables greetd before
+enabling SDDM, because `systemctl enable sddm` fails while greetd still owns the
+`display-manager.service` alias. It never stops a running display manager, so a
+switch on a live machine takes effect at the next reboot.
+
+`sshd.service` is deliberately not among them. `ssh_enabled` defaults to false:
+the ssh role still installs and proves the hardened sshd configuration during a
+run, and the final task of the final play then stops and disables sshd and
+removes its UFW allowance, so nothing listens on the SSH port afterwards. A
+remote run therefore works once, over the sshd that is already up, but cannot
+open a new connection afterwards; start sshd from the console or run with
+`-e ssh_enabled=true` before provisioning remotely again. That also means
+`prove-idempotency.sh` needs `-e ssh_enabled=true`, because enabling sshd for the
+checks and disabling it again is a change on every run by design.
+
+LocalSend is reachable on port 53317, TCP and UDP, from the ranges in
+`localsend_source_ranges` only. UDP carries its multicast discovery, so closing
+it would force adding every device by IP by hand.
+
+The boot role silences the boot console. This host boots a unified kernel image,
+so the cmdline is baked into the image from `/etc/kernel/cmdline` and editing
+`/etc/default/grub` alone changes nothing; the role writes both and rebuilds the
+UKI. Parameters take effect on the next boot. Set `boot_quiet: false` to keep the
+console verbose while debugging a boot problem.
 
 Hardware enrollment and account authentication are intentionally left alone.
 The playbook installs PAM U2F tools but does not enroll a YubiKey or deploy the
@@ -184,6 +226,14 @@ Existing SSH sessions survive an `sshd` restart. If the fresh key check fails,
 the firewall roles never run. From a retained root console, remove
 `/etc/ssh/sshd_config.d/99-ansible-hardening.conf`, validate with `sshd -t`, and
 restart `sshd.service`.
+
+If a quiet boot hides a failure you need to see, edit the kernel cmdline from the
+bootloader for one boot, or set `boot_quiet: false` and rerun `--tags boot`.
+`/etc/kernel/cmdline` and `/etc/default/grub` are backed up in place. The
+previous `grub.cfg` goes to `/var/lib/arch-autodeploy/grub.cfg.previous` instead,
+because `/boot` is a vfat EFI partition that rejects the colons in Ansible's
+timestamped backup names and cannot store an arbitrary mode. `grub.cfg` is
+regenerable anyway with `grub-mkconfig -o /boot/grub/grub.cfg`.
 
 To recover from a firewall mistake, run `ufw disable` from the console. To stop
 banning while preserving UFW, run `systemctl disable --now fail2ban`. Stow

@@ -1,0 +1,18 @@
+#!/bin/sh
+# Managed by Ansible (roles/boot). Do not edit by hand; rerun the role instead.
+# grub-mkconfig runs every executable in /etc/grub.d in order and appends its
+# stdout to grub.cfg. GRUB does not load a theme's fonts just because theme.txt
+# names them, so without these lines the menu falls back to the default font at
+# the default size.
+#
+# The paths use ${prefix}, not upstream's ($root)/boot/..., because /boot here
+# is its own EFI system partition: GRUB's $root is then that partition and the
+# /boot component does not exist inside it. ${prefix} is the directory GRUB was
+# installed into, so it resolves correctly whether or not /boot is separate.
+# The heredoc is quoted so ${prefix} reaches grub.cfg literally and is expanded
+# by GRUB at boot rather than by this shell.
+cat << 'GRUBEOF'
+{% for font in boot_grub_theme_fonts %}
+loadfont ${prefix}/themes/{{ boot_grub_theme_name }}/fonts/{{ font }}
+{% endfor %}
+GRUBEOF

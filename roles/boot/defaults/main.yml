@@ -1,0 +1,80 @@
+---
+# Silences the kernel and systemd status output that otherwise scrolls past on
+# every boot ("Starting ...", "[ OK ] Started ..."). Set to false to leave the
+# boot console verbose, which is what you want while debugging a boot problem.
+boot_quiet: true
+
+# `quiet` alone would be enough for systemd, which defaults show_status to false
+# when it sees `quiet`, but the rest are set explicitly so the behaviour does not
+# depend on that coupling, and so udev and the initrd phase are covered too.
+# vt.global_cursor_default=0 hides the blinking text cursor before the greeter
+# takes over. Any parameter listed here replaces an existing value for the same
+# key; parameters not listed here are always preserved.
+boot_quiet_params:
+  - quiet
+  - loglevel=3
+  - systemd.show_status=false
+  - rd.systemd.show_status=false
+  - rd.udev.log_level=3
+  - udev.log_level=3
+  - vt.global_cursor_default=0
+
+# The two places a kernel cmdline can come from on this host. Both are handled
+# when present, because the UKI is what actually boots here while GRUB is still
+# installed and generating menu entries.
+boot_uki_cmdline_path: /etc/kernel/cmdline
+boot_grub_default_path: /etc/default/grub
+boot_grub_cfg_path: /boot/grub/grub.cfg
+boot_grub_mkconfig_path: /usr/bin/grub-mkconfig
+boot_grub_loadfonts_path: /etc/grub.d/09_loadfonts
+
+# /boot is a vfat EFI system partition here (mounted fmask=0077). vfat rejects
+# the colons in Ansible's timestamped backup filenames with EINVAL and cannot
+# represent an arbitrary mode, so the grub.cfg backup is kept on the root
+# filesystem instead of next to the file it copies.
+boot_backup_dir: /var/lib/arch-autodeploy
+boot_grub_cfg_backup_path: /var/lib/arch-autodeploy/grub.cfg.previous
+
+# --- GRUB theme --------------------------------------------------------------
+# https://github.com/crocodile13/frieren-grub-theme
+#
+# Upstream ships an interactive install.sh. Its GRUB phase also rewrites
+# GRUB_CMDLINE_LINUX_DEFAULT to "quiet loglevel=3 splash apparmor=1
+# security=apparmor vt.global_cursor_default=0", which would fight the cmdline
+# this role manages above and switch on AppArmor flags for an AppArmor that is
+# not installed here. Its own README says not to let the script edit GRUB
+# blindly, so this role applies the theme keys only and leaves the cmdline and
+# GRUB_TIMEOUT alone.
+#
+# The repository publishes no license file, so there is nothing granting
+# redistribution rights; it is fetched at provision time rather than vendored.
+boot_grub_theme_enabled: true
+boot_grub_theme_name: frieren
+boot_grub_theme_repo_url: https://github.com/crocodile13/frieren-grub-theme.git
+boot_grub_theme_repo_version: main
+boot_grub_theme_repo_path: "{{ admin_home }}/builds/frieren-grub-theme"
+boot_grub_themes_dir: /boot/grub/themes
+
+# The theme ships one background and one theme.txt per resolution, and the two
+# are not named consistently (theme_1080p.txt against theme_1440.txt), so the
+# mapping is spelled out instead of derived. 1920x1080 or 2560x1440.
+boot_grub_theme_resolution: 1920x1080
+boot_grub_theme_variants:
+  1920x1080:
+    theme: theme_1080p.txt
+    background: background_1080.png
+  2560x1440:
+    theme: theme_1440.txt
+    background: background_1440.png
+
+# The theme ships eight .pf2 fonts totalling about 13 MB, but neither
+# theme.txt references any of the four unifont files. Everything under /boot
+# lives on the EFI system partition next to the unified kernel images, and every
+# font left there is also read at each boot, so only the fonts the installed
+# theme.txt actually names are kept. The keep list is parsed out of theme.txt
+# rather than hardcoded, so it stays correct if upstream changes fonts.
+boot_grub_theme_prune_unused_fonts: true
+
+# Refuse to copy the theme onto a nearly full EFI system partition: filling it
+# breaks the next kernel upgrade or UKI rebuild.
+boot_min_free_boot_mb: 50

@@ -57,6 +57,10 @@
       tags: [users, always]
     - role: packages
       tags: [packages]
+    # After packages, so the kernel and mkinitcpio presets are settled before
+    # the unified kernel image is rebuilt with the quiet cmdline.
+    - role: boot
+      tags: [boot]
     - role: docker
       tags: [docker]
     - role: dotfiles
@@ -121,3 +125,48 @@
       when: admin_password_hash | length > 0
       no_log: true
       tags: [users, password]
+
+    # Placed after every check that needs SSH, because these two tasks close the
+    # port this play is running over. Ordering is what makes them safe: the ssh
+    # role hardens and proves sshd, ufw proves the firewall did not lock the host
+    # out, verification re-proves both, and only then is SSH taken down.
+    # Arch's sshd.service sets KillMode=process, so stopping the unit leaves the
+    # established Ansible session intact and these tasks still report back. This
+    # host is not socket-activated (there is no sshd.socket), so disabling
+    # sshd.service is enough to stop anything listening on the port.
+    # Rollback from the console: `systemctl enable --now sshd`, then
+    # `ufw limit <port>/tcp`, or rerun with -e ssh_enabled=true.
+    - name: Check whether UFW still allows the SSH port
+      ansible.builtin.command:
+        argv: [ufw, status]
+      register: ssh_teardown_ufw_status
+      changed_when: false
+      failed_when: false
+      when: not (ssh_enabled | bool)
+      tags: [ssh, ssh_teardown]
+
+    # Only deletes a rule that is actually present, so a rerun that skipped the
+    # ufw role does not fail on a non-existent rule.
+    - name: Remove the UFW SSH allowance because SSH is disabled
+      community.general.ufw:
+        rule: limit
+        port: "{{ effective_ssh_port | string }}"
+        proto: tcp
+        delete: true
+      when:
+        - not (ssh_enabled | bool)
+        # Undefined when only the ssh_teardown tag is selected, because the ssh
+        # role that records it did not run. Leaving the rule in place is the safe
+        # outcome there; sshd is still stopped below, so nothing is listening.
+        - effective_ssh_port is defined
+        - (ssh_teardown_ufw_status.rc | default(1)) == 0
+        - (effective_ssh_port | string) in (ssh_teardown_ufw_status.stdout | default(''))
+      tags: [ssh, ssh_teardown]
+
+    - name: Stop and disable sshd because SSH is disabled
+      ansible.builtin.systemd_service:
+        name: sshd.service
+        enabled: false
+        state: stopped
+      when: not (ssh_enabled | bool)
+      tags: [ssh, ssh_teardown]
