@@ -1,0 +1,4 @@
+artifacts/
+group_vars/all/vault.yml
+*.retry
+

@@ -1,0 +1,171 @@
+---
+- name: Require remote Ansible runs to connect as liam before disabling root SSH
+  ansible.builtin.assert:
+    that:
+      - >-
+        (ansible_connection | default('ssh')) == 'local' or
+        (ansible_user | default('')) == admin_user
+    fail_msg: >-
+      Set ansible_user={{ admin_user }} and confirm that connection works before
+      hardening SSH. Reconnecting as root will fail after PermitRootLogin=no.
+
+- name: Ensure the liam SSH directory exists
+  ansible.builtin.file:
+    path: "{{ admin_home }}/.ssh"
+    state: directory
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0700"
+
+- name: Install the vaulted administrative public key when supplied
+  ansible.posix.authorized_key:
+    user: "{{ admin_user }}"
+    key: "{{ admin_authorized_key }}"
+    state: present
+    manage_dir: false
+    exclusive: false
+  when: admin_authorized_key | length > 0
+  no_log: true
+
+- name: Create an empty authorized_keys file when no vaulted key was supplied
+  ansible.builtin.copy:
+    dest: "{{ admin_home }}/.ssh/authorized_keys"
+    content: ""
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0600"
+    force: false
+
+- name: Enforce authorized_keys ownership and permissions
+  ansible.builtin.file:
+    path: "{{ admin_home }}/.ssh/authorized_keys"
+    state: file
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0600"
+
+- name: Confirm authorized_keys contains a usable public key
+  ansible.builtin.command:
+    argv: [ssh-keygen, -l, -f, "{{ admin_home }}/.ssh/authorized_keys"]
+  register: authorized_key_check
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Refuse to disable password authentication without a key
+  ansible.builtin.assert:
+    that:
+      - authorized_key_check.rc == 0
+    fail_msg: >-
+      {{ admin_home }}/.ssh/authorized_keys has no recognized SSH public key.
+      Supply vault_liam_authorized_key or install a key before rerunning.
+
+- name: Enable and start sshd before key-authentication preflight
+  ansible.builtin.systemd_service:
+    name: sshd.service
+    enabled: true
+    state: started
+
+- name: Read the effective pre-hardening sshd configuration
+  ansible.builtin.command:
+    argv: [sshd, -T]
+  register: sshd_preflight_config
+  changed_when: false
+
+- name: Record the configured SSH port
+  ansible.builtin.set_fact:
+    effective_ssh_port: >-
+      {{ (sshd_preflight_config.stdout_lines
+          | select('match', '(?i)^port ')
+          | first).split()[1] | int }}
+
+# Both facts are resolved here, in the target's own context, on purpose.
+# ssh_validation_host re-evaluates to 127.0.0.1 under `delegate_to: localhost`
+# because ansible_connection is 'local' for the delegate, so referencing it
+# directly from a delegated task points the check at the controller instead of
+# the workstation. Baking the value into a fact pins it to the real host.
+- name: Build the controller-side SSH validation command
+  ansible.builtin.set_fact:
+    ssh_validation_target: "{{ ssh_validation_host }}"
+    ssh_validation_argv: >-
+      {{ ['ssh', '-F', '/dev/null', '-o', 'BatchMode=yes',
+          '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=no',
+          '-o', 'UserKnownHostsFile=/dev/null', '-p',
+          (effective_ssh_port | string)]
+         + (['-o', 'IdentitiesOnly=yes', '-i', ssh_validation_identity_file]
+            if ssh_validation_identity_file | length > 0 else [])
+         + [admin_user ~ '@' ~ ssh_validation_host, 'id'] }}
+
+- name: Verify fresh key authentication as liam before disabling passwords
+  ansible.builtin.command:
+    argv: "{{ ssh_validation_argv }}"
+  delegate_to: localhost
+  become: false
+  register: ssh_pre_hardening_output
+  changed_when: false
+
+- name: Ensure sshd reads the managed drop-in before other settings
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    line: Include /etc/ssh/sshd_config.d/*.conf
+    insertbefore: BOF
+    state: present
+    validate: /usr/bin/sshd -t -f %s
+  notify: Restart sshd after validated configuration changes
+
+- name: Install the validated SSH hardening drop-in
+  ansible.builtin.template:
+    src: 99-ansible-hardening.conf.j2
+    dest: /etc/ssh/sshd_config.d/99-ansible-hardening.conf
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/bin/sshd -t -f %s
+  diff: true
+  notify: Restart sshd after validated configuration changes
+
+- name: Validate the complete sshd configuration before restart
+  ansible.builtin.command:
+    argv: [sshd, -t]
+  changed_when: false
+
+- name: Apply validated SSH changes now
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for the configured SSH port after restart
+  ansible.builtin.wait_for:
+    host: "{{ ssh_validation_target }}"
+    port: "{{ effective_ssh_port }}"
+    connect_timeout: 5
+    timeout: 30
+  delegate_to: localhost
+  become: false
+
+- name: Verify a fresh key-authenticated SSH connection as liam after restart
+  ansible.builtin.command:
+    argv: "{{ ssh_validation_argv }}"
+  delegate_to: localhost
+  become: false
+  register: ssh_post_hardening_output
+  changed_when: false
+
+- name: Read the effective hardened sshd configuration
+  ansible.builtin.command:
+    argv: [sshd, -T]
+  register: sshd_effective_output
+  changed_when: false
+
+- name: Assert the effective SSH hardening settings
+  ansible.builtin.assert:
+    that:
+      - "'permitrootlogin no' in (sshd_effective_output.stdout_lines | map('lower'))"
+      - "'passwordauthentication no' in (sshd_effective_output.stdout_lines | map('lower'))"
+      - "'pubkeyauthentication yes' in (sshd_effective_output.stdout_lines | map('lower'))"
+      - "'kbdinteractiveauthentication no' in (sshd_effective_output.stdout_lines | map('lower'))"
+      - "'maxauthtries 3' in (sshd_effective_output.stdout_lines | map('lower'))"
+      - "'x11forwarding no' in (sshd_effective_output.stdout_lines | map('lower'))"
+      - >-
+        ('allowagentforwarding ' ~ ('yes' if ssh_allow_agent_forwarding else 'no'))
+        in (sshd_effective_output.stdout_lines | map('lower'))
+      - "'clientaliveinterval 300' in (sshd_effective_output.stdout_lines | map('lower'))"
+      - "'clientalivecountmax 2' in (sshd_effective_output.stdout_lines | map('lower'))"

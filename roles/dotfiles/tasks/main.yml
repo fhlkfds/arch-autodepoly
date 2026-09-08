@@ -1,0 +1,104 @@
+---
+- name: Clone or fast-forward the dotfiles repository without overwriting local changes
+  ansible.builtin.git:
+    repo: "{{ dotfiles_repo_url }}"
+    dest: "{{ dotfiles_repo_path }}"
+    version: "{{ dotfiles_repo_version }}"
+    update: true
+    force: false
+  become_user: "{{ admin_user }}"
+  register: dotfiles_checkout
+
+- name: Build a canonical Stow manifest from tracked package files
+  ansible.builtin.script:
+    cmd: >-
+      {{ role_path }}/files/stow_manifest.py
+      --repo {{ dotfiles_repo_path | quote }}
+      --home {{ admin_home | quote }}
+      {{ stow_packages | map('quote') | join(' ') }}
+    executable: /usr/bin/python3
+  become_user: "{{ admin_user }}"
+  register: stow_plan_command
+  changed_when: false
+
+- name: Record Stow manifest, conflicts, and required changes
+  ansible.builtin.set_fact:
+    stow_manifest: "{{ (stow_plan_command.stdout | from_json).entries }}"
+    stow_targets_needing_change: >-
+      {{ (stow_plan_command.stdout | from_json).needs_changes }}
+    stow_conflicts: "{{ (stow_plan_command.stdout | from_json).conflicts }}"
+    stow_packages_needing_change: >-
+      {{ (stow_plan_command.stdout | from_json).packages_needing_change }}
+
+- name: Set the conflict backup directory for this run
+  ansible.builtin.set_fact:
+    stow_backup_path: "{{ admin_home }}/dotfiles-backup-{{ ansible_date_time.iso8601_basic_short }}"
+  when: stow_conflicts | length > 0
+
+- name: Create the conflict backup root
+  ansible.builtin.file:
+    path: "{{ stow_backup_path }}"
+    state: directory
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0700"
+  when: stow_conflicts | length > 0
+
+- name: Create parent directories for conflicting-file backups
+  ansible.builtin.file:
+    path: "{{ stow_backup_path }}/{{ item.relative | dirname }}"
+    state: directory
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0700"
+  loop: "{{ stow_conflicts }}"
+  loop_control:
+    label: "{{ item.relative }}"
+
+# Rollback: move a backed-up path from stow_backup_path to its original target,
+# after first running `stow -D` for the package that owns the target.
+- name: Move only conflicting targets into the timestamped backup
+  ansible.builtin.command:
+    argv: [mv, --, "{{ item.target }}", "{{ stow_backup_path }}/{{ item.relative }}"]
+  become_user: "{{ admin_user }}"
+  loop: "{{ stow_conflicts }}"
+  loop_control:
+    label: "{{ item.target }}"
+
+- name: Deploy approved packages with GNU Stow as liam
+  ansible.builtin.command:
+    argv: [stow, --no-folding, --target, "{{ admin_home }}", "{{ item }}"]
+    chdir: "{{ dotfiles_repo_path }}"
+  become_user: "{{ admin_user }}"
+  environment:
+    HOME: "{{ admin_home }}"
+  loop: "{{ stow_packages }}"
+  changed_when: item in stow_packages_needing_change
+
+- name: Rebuild the canonical Stow manifest after deployment
+  ansible.builtin.script:
+    cmd: >-
+      {{ role_path }}/files/stow_manifest.py
+      --repo {{ dotfiles_repo_path | quote }}
+      --home {{ admin_home | quote }}
+      {{ stow_packages | map('quote') | join(' ') }}
+    executable: /usr/bin/python3
+  become_user: "{{ admin_user }}"
+  register: stow_verify_command
+  changed_when: false
+
+- name: Assert every tracked package file resolves into the checkout
+  ansible.builtin.assert:
+    that:
+      - (stow_verify_command.stdout | from_json).needs_changes | length == 0
+    fail_msg: >-
+      Unexpected Stow targets:
+      {{ (stow_verify_command.stdout | from_json).needs_changes
+         | map(attribute='target') | join(', ') }}
+
+- name: Record verified Stow symlinks for the final report
+  ansible.builtin.set_fact:
+    stow_verification_output: >-
+      {{ (stow_verify_command.stdout | from_json).entries
+         | map(attribute='target')
+         | join('\n') }}

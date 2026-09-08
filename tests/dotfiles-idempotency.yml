@@ -1,0 +1,116 @@
+---
+- name: Exercise Stow deployment in an isolated home
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: true
+  vars_files:
+    - ../group_vars/all.yml
+  vars:
+    admin_user: liam
+  pre_tasks:
+    - name: Require an explicit isolated test home
+      ansible.builtin.assert:
+        that:
+          - test_home is defined
+          - test_home is match('^/tmp/arch-autodeploy-dotfiles-test\\.[^/]+/home$')
+
+    - name: Create the isolated test home
+      ansible.builtin.file:
+        path: "{{ test_home }}"
+        state: directory
+        mode: "0700"
+
+    - name: Check whether the fixture checkout already exists
+      ansible.builtin.stat:
+        path: "{{ test_home }}/dotfiles"
+      register: test_checkout
+
+    - name: Seed one existing file to exercise conflict backup
+      ansible.builtin.copy:
+        dest: "{{ test_home }}/.zshrc"
+        content: "pre-existing test file\n"
+        mode: "0600"
+      when: not test_checkout.stat.exists
+
+    - name: Create an unrelated legacy Hyprland directory
+      ansible.builtin.file:
+        path: "{{ test_home }}/legacy-hypr"
+        state: directory
+        mode: "0700"
+      when: not test_checkout.stat.exists
+
+    - name: Seed a file behind a conflicting directory symlink
+      ansible.builtin.copy:
+        dest: "{{ test_home }}/legacy-hypr/hyprland.lua"
+        content: "legacy config\n"
+        mode: "0600"
+      when: not test_checkout.stat.exists
+
+    - name: Create the config parent for the directory-symlink fixture
+      ansible.builtin.file:
+        path: "{{ test_home }}/.config"
+        state: directory
+        mode: "0700"
+      when: not test_checkout.stat.exists
+
+    - name: Seed a conflicting folded directory symlink
+      ansible.builtin.file:
+        src: "{{ test_home }}/legacy-hypr"
+        dest: "{{ test_home }}/.config/hypr"
+        state: link
+      when: not test_checkout.stat.exists
+
+  roles:
+    - role: dotfiles
+      admin_home: "{{ test_home }}"
+      dotfiles_repo_path: "{{ test_home }}/dotfiles"
+
+  post_tasks:
+    - name: Find the conflict backup directory
+      ansible.builtin.find:
+        paths: "{{ test_home }}"
+        patterns: dotfiles-backup-*
+        recurse: false
+        file_type: directory
+      register: test_backup_directories
+
+    - name: Find the backed-up conflict fixture
+      ansible.builtin.find:
+        paths: "{{ test_backup_directories.files[0].path }}"
+        patterns: .zshrc
+        recurse: true
+        hidden: true
+        file_type: file
+      register: test_backup_files
+      when: test_backup_directories.matched == 1
+
+    - name: Read the backed-up conflict fixture
+      ansible.builtin.slurp:
+        src: "{{ test_backup_files.files[0].path }}"
+      register: test_backup_content
+      when:
+        - test_backup_directories.matched == 1
+        - test_backup_files.matched == 1
+
+    - name: Check the backed-up directory symlink
+      ansible.builtin.stat:
+        path: "{{ test_backup_directories.files[0].path }}/.config/hypr"
+        follow: false
+      register: test_backup_hypr_link
+      when: test_backup_directories.matched == 1
+
+    - name: Read the legacy file after backing up its directory symlink
+      ansible.builtin.slurp:
+        src: "{{ test_home }}/legacy-hypr/hyprland.lua"
+      register: test_legacy_hypr_content
+
+    - name: Assert exactly one original conflict was preserved
+      ansible.builtin.assert:
+        that:
+          - test_backup_directories.matched == 1
+          - test_backup_files.matched == 1
+          - (test_backup_content.content | b64decode) == "pre-existing test file\n"
+          - test_backup_hypr_link.stat.islnk | default(false)
+          - test_backup_hypr_link.stat.lnk_source == test_home ~ '/legacy-hypr'
+          - (test_legacy_hypr_content.content | b64decode) == "legacy config\n"

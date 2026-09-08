@@ -1,0 +1,8 @@
+---
+# Copy to group_vars/vault.yml, replace the examples, then run:
+#   ansible-vault encrypt group_vars/vault.yml
+# Password hashes must already be crypt(3)-compatible, for example yescrypt.
+vault_liam_password_hash: "$y$j9T$REPLACE_WITH_A_REAL_HASH"
+vault_liam_authorized_key: "ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY"
+vault_admin_ip: "192.0.2.10/32"
+

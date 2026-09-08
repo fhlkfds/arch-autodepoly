@@ -1,0 +1,395 @@
+---
+- name: Fully upgrade Arch before installing packages
+  block:
+    - name: Refresh package databases and run pacman -Syu
+      community.general.pacman:
+        update_cache: true
+        upgrade: true
+      register: full_upgrade
+      changed_when: (full_upgrade.packages | default([])) | length > 0
+  rescue:
+    - name: Confirm that the upgrade failed because of package signatures
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((ansible_failed_result.msg | default('')) ~
+             (ansible_failed_result.stdout | default('')) ~
+             (ansible_failed_result.stderr | default(''))) is
+            regex('(?i)(signature|keyring|unknown trust|invalid or corrupted package)')
+        fail_msg: >-
+          pacman -Syu failed for a reason unrelated to signatures; refusing a
+          speculative keyring repair. Original failure: {{ ansible_failed_result }}
+
+    - name: Refresh archlinux-keyring after a signature failure
+      community.general.pacman:
+        name: archlinux-keyring
+        state: latest
+        update_cache: true
+
+    - name: Retry the full upgrade after refreshing the keyring
+      community.general.pacman:
+        update_cache: true
+        upgrade: true
+      register: full_upgrade_retry
+      changed_when: (full_upgrade_retry.packages | default([])) | length > 0
+
+- name: Install official packages derived from the dotfiles repository
+  community.general.pacman:
+    name: "{{ official_packages }}"
+    state: present
+
+# opendoas ships no default configuration, and the stowed zsh dotfiles set
+# `alias sudo='doas'` (dotfiles zsh/.zshrc), so without this file every
+# interactive `sudo ...` on the host fails with
+# "doas: doas is not enabled, /etc/doas.conf: No such file or directory".
+# This lives in the packages role rather than users because the validate step
+# needs /usr/bin/doas to exist, and installing opendoas earlier would mean
+# fetching a package before the full `pacman -Syu` above completes.
+#
+# Security: this grants liam the same root access the sudoers rule already
+# grants, no more. `persist` caches the authentication for a few minutes,
+# mirroring sudo's timestamp behaviour. A password is still required.
+# Rollback: `rm /etc/doas.conf`. Interactive `sudo` then breaks again, but
+# Ansible's own become uses /usr/bin/sudo directly and is unaffected.
+- name: Install the validated doas rule for liam
+  ansible.builtin.copy:
+    dest: /etc/doas.conf
+    content: "permit persist {{ admin_user }} as root\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/bin/doas -C %s
+
+- name: Check whether yay is already installed
+  ansible.builtin.command:
+    argv: [yay, --version]
+  register: yay_precheck
+  changed_when: false
+  failed_when: false
+
+- name: Create the user build directory
+  ansible.builtin.file:
+    path: "{{ admin_home }}/builds"
+    state: directory
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0755"
+
+- name: Build yay as liam when it is absent
+  when: yay_precheck.rc != 0
+  block:
+    - name: Clone the yay AUR packaging repository as liam
+      ansible.builtin.git:
+        repo: https://aur.archlinux.org/yay.git
+        dest: "{{ admin_home }}/builds/yay"
+        version: master
+        update: true
+        force: false
+      become_user: "{{ admin_user }}"
+
+    # makepkg refuses root. This narrowly scoped, temporary rule lets makepkg
+    # invoke pacman; the always block removes it even if the build fails.
+    - name: Grant temporary non-interactive pacman access for the yay build
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ admin_user }}-makepkg"
+        content: "{{ admin_user }} ALL=(root) NOPASSWD: /usr/bin/pacman\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+
+    - name: Run makepkg -si for yay as liam
+      ansible.builtin.command:
+        argv: [makepkg, -si, --noconfirm]
+        chdir: "{{ admin_home }}/builds/yay"
+      become_user: "{{ admin_user }}"
+      environment:
+        HOME: "{{ admin_home }}"
+        # AUR packages can run npm/Vitest during makepkg. Keep their output
+        # plain so Ansible failure JSON never exposes serialized ANSI escapes.
+        NO_COLOR: "1"
+        FORCE_COLOR: "0"
+        CLICOLOR: "0"
+        CLICOLOR_FORCE: "0"
+        TERM: dumb
+        CI: "true"
+  always:
+    # Rollback: deleting this file removes the temporary passwordless pacman
+    # grant without changing the permanent sudo policy.
+    - name: Remove temporary makepkg sudo access
+      ansible.builtin.file:
+        path: "/etc/sudoers.d/{{ admin_user }}-makepkg"
+        state: absent
+
+- name: Verify yay is installed
+  ansible.builtin.command:
+    argv: [yay, --version]
+  register: yay_version_output
+  changed_when: false
+
+- name: Find missing AUR packages
+  ansible.builtin.command:
+    argv: [pacman, -Q, "{{ item }}"]
+  loop: "{{ aur_packages }}"
+  register: aur_package_queries
+  changed_when: false
+  failed_when: false
+
+- name: Record missing AUR packages
+  ansible.builtin.set_fact:
+    missing_aur_packages: >-
+      {{ aur_package_queries.results
+         | selectattr('rc', 'ne', 0)
+         | map(attribute='item')
+         | list }}
+
+- name: Build the native argv list for yay AUR installs
+  ansible.builtin.set_fact:
+    aur_yay_install_argv:
+      - yay
+      - -S
+      - --needed
+      - --noconfirm
+      - --answerclean
+      - None
+      - --answerdiff
+      - None
+
+- name: Install detected AUR packages with yay
+  when: missing_aur_packages | length > 0
+  block:
+    # Rollback: this grant is removed in the always block. It is limited to
+    # pacman because yay itself must run unprivileged.
+    - name: Grant temporary non-interactive pacman access for yay
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ admin_user }}-yay"
+        content: "{{ admin_user }} ALL=(root) NOPASSWD: /usr/bin/pacman\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+
+    - name: >-
+        Batch-install detected AUR packages: brave-bin, claude-code,
+        helium-browser-bin, hermes-agent-desktop, hyprvoice-bin, localsend-bin,
+        looking-glass, mpvpaper, pokemon-colorscripts-git, t3code-bin,
+        wl-screenrec-git, and xdg-terminal-exec
+      # 2026-09-06: t3-code-git was dropped because its upstream HEAD build
+      # fails at Bun's frozen-lockfile check. t3code-bin is the upstream-
+      # maintained prebuilt package and avoids that broken source-build path.
+      ansible.builtin.command:
+        # argv stays a native list; do not turn it into an interpolated command
+        # string, which can corrupt module arguments and cause JSON warnings.
+        argv: "{{ aur_yay_install_argv + missing_aur_packages }}"
+      become_user: "{{ admin_user }}"
+      environment:
+        HOME: "{{ admin_home }}"
+        # Rollback: remove these environment values to restore the AUR
+        # builder's normal terminal formatting; they do not change host state.
+        NO_COLOR: "1"
+        FORCE_COLOR: "0"
+        CLICOLOR: "0"
+        CLICOLOR_FORCE: "0"
+        TERM: dumb
+        CI: "true"
+      register: aur_batch_install
+      changed_when: aur_batch_install.rc == 0
+      failed_when: false
+
+    - name: Retry each AUR package after a failed batch
+      ansible.builtin.command:
+        argv: "{{ aur_yay_install_argv + [item] }}"
+      become_user: "{{ admin_user }}"
+      environment:
+        HOME: "{{ admin_home }}"
+        NO_COLOR: "1"
+        FORCE_COLOR: "0"
+        CLICOLOR: "0"
+        CLICOLOR_FORCE: "0"
+        TERM: dumb
+        CI: "true"
+      loop: "{{ missing_aur_packages }}"
+      loop_control:
+        label: "{{ item }}"
+      register: aur_individual_install
+      changed_when: aur_individual_install.rc == 0
+      failed_when: false
+      when: aur_batch_install.rc != 0
+
+    - name: Record AUR packages that still failed after individual retries
+      ansible.builtin.set_fact:
+        aur_failed_packages: >-
+          {{ aur_individual_install.results | default([])
+             | selectattr('rc', 'ne', 0)
+             | map(attribute='item')
+             | list }}
+      when: aur_batch_install.rc != 0
+
+    - name: Assert all requested AUR packages installed
+      ansible.builtin.assert:
+        that:
+          - aur_batch_install.rc == 0 or (aur_failed_packages | default([]) | length == 0)
+        fail_msg: >-
+          yay batch installation failed with rc={{ aur_batch_install.rc }} and
+          individual retries still failed for:
+          {{ aur_failed_packages | default([]) | join(', ') }}.
+
+  rescue:
+    - name: Report the failed AUR installation before cleanup
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'yay batch installation failed with rc=' ~ aur_batch_install.rc ~
+             '; individual retries still failed for: ' ~
+             (aur_failed_packages | join(', ')) ~ '.'
+             if (aur_failed_packages | default([]) | length > 0)
+             else 'The AUR installation block encountered an unexpected Ansible failure.' }}
+          The temporary pacman sudoers rule will still be removed.
+
+    - name: Stop after a failed AUR installation
+      ansible.builtin.fail:
+        msg: >-
+          {{ 'AUR packages still failing after individual retries: ' ~
+             (aur_failed_packages | join(', ')) ~ '.'
+             if (aur_failed_packages | default([]) | length > 0)
+             else 'AUR installation did not complete due to an Ansible module error.' }}
+  always:
+    # Rollback: remove the temporary privilege immediately, including on error.
+    - name: Remove temporary yay sudo access
+      ansible.builtin.file:
+        path: "/etc/sudoers.d/{{ admin_user }}-yay"
+        state: absent
+
+- name: Clone Oh My Zsh as documented by the dotfiles repository
+  ansible.builtin.git:
+    repo: "{{ oh_my_zsh_repo_url }}"
+    dest: "{{ admin_home }}/.oh-my-zsh"
+    version: master
+    depth: 1
+    update: true
+    force: false
+  become_user: "{{ admin_user }}"
+
+- name: Clone Powerlevel10k into the Oh My Zsh custom theme directory
+  ansible.builtin.git:
+    repo: "{{ powerlevel10k_repo_url }}"
+    dest: "{{ admin_home }}/.oh-my-zsh/custom/themes/powerlevel10k"
+    version: master
+    depth: 1
+    update: true
+    force: false
+  become_user: "{{ admin_user }}"
+
+- name: Clone fzf-tab into the Oh My Zsh custom plugin directory
+  ansible.builtin.git:
+    repo: "{{ fzf_tab_repo_url }}"
+    dest: "{{ admin_home }}/.oh-my-zsh/custom/plugins/fzf-tab"
+    version: master
+    depth: 1
+    update: true
+    force: false
+  become_user: "{{ admin_user }}"
+
+- name: Ensure the standard XDG user directories exist (Desktop, Documents, Downloads, Pictures, Videos, ...)
+  ansible.builtin.command:
+    argv: [xdg-user-dirs-update]
+  become_user: "{{ admin_user }}"
+  environment:
+    HOME: "{{ admin_home }}"
+  args:
+    creates: "{{ admin_home }}/.config/user-dirs.dirs"
+
+- name: Probe the repository-documented ttfx static binary
+  ansible.builtin.command:
+    argv: [file, "{{ admin_home }}/.local/bin/ttfx"]
+  register: ttfx_probe
+  changed_when: false
+  failed_when: false
+
+- name: Build ttfx from its documented Git source as liam
+  ansible.builtin.command:
+    argv:
+      - cargo
+      - install
+      - --locked
+      - --root
+      - "{{ admin_home }}/.local"
+      - --target
+      - x86_64-unknown-linux-musl
+      - --git
+      - "{{ ttfx_repo_url }}"
+      - --rev
+      - "{{ ttfx_git_rev }}"
+      - ttfx
+  become_user: "{{ admin_user }}"
+  environment:
+    HOME: "{{ admin_home }}"
+  when: >-
+    ttfx_probe.rc != 0 or
+    ttfx_probe.stdout is not regex('statically linked|static-pie linked')
+
+- name: Verify the ttfx static binary
+  ansible.builtin.command:
+    argv: [file, "{{ admin_home }}/.local/bin/ttfx"]
+  register: ttfx_verify_output
+  changed_when: false
+  failed_when: >-
+    ttfx_verify_output.rc != 0 or
+    ttfx_verify_output.stdout is not regex('statically linked|static-pie linked')
+
+# A full `pacman -Syu` above may replace the kernel, which deletes
+# /usr/lib/modules/<running release> and installs the new one. The running
+# kernel then cannot modprobe anything: nft_chain_nat and nft_compat vanish,
+# nftables netlink calls fail with EINVAL, and Docker cannot build its NAT
+# chain. Every role after this one depends on that module tree, so reboot here
+# rather than letting the docker role stop a half-provisioned host.
+# Rollback: delete these three tasks. Provisioning then fails at the docker
+# kernel guard whenever an upgrade replaced the kernel, and you reboot and
+# rerun by hand.
+- name: Read the running kernel release after the full upgrade
+  ansible.builtin.command:
+    argv: [uname, -r]
+  register: packages_running_kernel
+  changed_when: false
+
+- name: Check whether the running kernel kept its module tree
+  ansible.builtin.stat:
+    path: "/usr/lib/modules/{{ packages_running_kernel.stdout }}"
+  register: packages_running_kernel_modules
+
+# The module's default readiness probe is `whoami`, which passes the instant
+# sshd answers. /home is its own btrfs subvolume here (subvol=/@home in
+# /etc/fstab) and sshd accepts connections before local-fs.target has mounted
+# it, so Ansible reconnects into a host with no /home/liam, cannot create
+# ~/.ansible/tmp, and the next task dies with "Could not chdir to home
+# directory". Wait for every fstab mount to settle, then confirm the home
+# directory is really there before handing control back.
+- name: Reboot into the newly installed kernel
+  ansible.builtin.reboot:
+    reboot_timeout: 600
+    post_reboot_delay: 5
+    test_command: >-
+      systemctl is-active --quiet local-fs.target &&
+      test -d {{ admin_home | quote }}
+    msg: Ansible is rebooting this host into the kernel it just installed.
+  when: not (packages_running_kernel_modules.stat.isdir | default(false))
+
+- name: Re-read the running kernel release after any reboot
+  ansible.builtin.command:
+    argv: [uname, -r]
+  register: packages_kernel_after_reboot
+  changed_when: false
+
+- name: Confirm the running kernel now has its module tree
+  ansible.builtin.stat:
+    path: "/usr/lib/modules/{{ packages_kernel_after_reboot.stdout }}"
+  register: packages_modules_after_reboot
+
+- name: Require a usable module tree before any later role runs
+  ansible.builtin.assert:
+    that:
+      - packages_modules_after_reboot.stat.isdir | default(false)
+    fail_msg: >-
+      The running kernel ({{ packages_kernel_after_reboot.stdout }}) still has
+      no module tree in /usr/lib/modules after the reboot step. The host booted
+      an unexpected kernel; check the bootloader entry and initramfs before
+      rerunning. No Docker or firewall state has been changed.

@@ -1,0 +1,255 @@
+---
+- name: Read final liam identity
+  ansible.builtin.command:
+    argv: [id, "{{ admin_user }}"]
+  register: verify_id
+  changed_when: false
+
+- name: Validate the final sudoers configuration
+  ansible.builtin.command:
+    argv: [visudo, -cf, /etc/sudoers]
+  register: verify_sudoers
+  changed_when: false
+
+- name: Read the managed sudoers rule
+  ansible.builtin.command:
+    argv: [cat, "/etc/sudoers.d/{{ admin_user }}"]
+  register: verify_sudoers_content
+  changed_when: false
+
+- name: Validate the final doas configuration
+  ansible.builtin.command:
+    argv: [doas, -C, /etc/doas.conf]
+  register: verify_doas
+  changed_when: false
+
+- name: Read the managed doas rule
+  ansible.builtin.command:
+    argv: [cat, /etc/doas.conf]
+  register: verify_doas_content
+  changed_when: false
+
+- name: Read the installed yay version
+  ansible.builtin.command:
+    argv: [yay, --version]
+  register: verify_yay
+  changed_when: false
+
+- name: Query all explicitly configured packages
+  ansible.builtin.command:
+    argv: >-
+      {{ ['pacman', '-Q']
+         + official_packages
+         + aur_packages
+         + docker_packages
+         + ['ufw', 'fail2ban'] }}
+  register: verify_packages
+  changed_when: false
+
+# base-devel is a meta package, not a group: `pacman -Si base-devel` reports
+# "Groups: None", so `pacman -Qg base-devel` fails with "group not found".
+# -Qi shows the installed version plus the toolchain it depends on, and pacman's
+# own dependency resolution guarantees those deps are present.
+- name: Show the installed base-devel meta package and its dependencies
+  ansible.builtin.command:
+    argv: [pacman, -Qi, base-devel]
+  register: verify_base_devel
+  changed_when: false
+
+- name: Verify Docker access as liam
+  ansible.builtin.command:
+    argv: [docker, info]
+  become_user: "{{ admin_user }}"
+  environment:
+    HOME: "{{ admin_home }}"
+  register: verify_docker_info
+  changed_when: false
+
+- name: Run the final hello-world container as liam
+  ansible.builtin.command:
+    argv: [docker, run, --rm, hello-world]
+  become_user: "{{ admin_user }}"
+  environment:
+    HOME: "{{ admin_home }}"
+  register: verify_docker_hello
+  changed_when: false
+
+- name: Validate sshd syntax
+  ansible.builtin.command:
+    argv: [sshd, -t]
+  register: verify_sshd_syntax
+  changed_when: false
+
+- name: Read the final effective sshd configuration
+  ansible.builtin.command:
+    argv: [sshd, -T]
+  register: verify_sshd_effective
+  changed_when: false
+
+- name: Record the final SSH port
+  ansible.builtin.set_fact:
+    effective_ssh_port: >-
+      {{ (verify_sshd_effective.stdout_lines
+          | select('match', '(?i)^port ')
+          | first).split()[1] | int }}
+
+- name: Build the final controller-side SSH check
+  ansible.builtin.set_fact:
+    final_ssh_validation_argv: >-
+      {{ ['ssh', '-F', '/dev/null', '-o', 'BatchMode=yes',
+          '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=no',
+          '-o', 'UserKnownHostsFile=/dev/null', '-p',
+          (effective_ssh_port | string)]
+         + (['-o', 'IdentitiesOnly=yes', '-i', ssh_validation_identity_file]
+            if ssh_validation_identity_file | length > 0 else [])
+         + [admin_user ~ '@' ~ ssh_validation_host, 'id'] }}
+
+- name: Verify final fresh SSH key authentication as liam
+  ansible.builtin.command:
+    argv: "{{ final_ssh_validation_argv }}"
+  delegate_to: localhost
+  become: false
+  register: verify_ssh_connection
+  changed_when: false
+
+- name: Read verbose UFW status
+  ansible.builtin.command:
+    argv: [ufw, status, verbose]
+  register: verify_ufw
+  changed_when: false
+
+- name: Read fail2ban sshd jail status
+  ansible.builtin.command:
+    argv: [fail2ban-client, status, sshd]
+  register: verify_fail2ban
+  changed_when: false
+
+- name: Read fail2ban sshd jail actions
+  ansible.builtin.command:
+    argv: [fail2ban-client, get, sshd, actions]
+  register: verify_fail2ban_actions
+  changed_when: false
+
+- name: Read fail2ban sshd ignore list
+  ansible.builtin.command:
+    argv: [fail2ban-client, get, sshd, ignoreip]
+  register: verify_fail2ban_ignoreip
+  changed_when: false
+
+- name: Resolve key Stow targets through direct or folded links
+  ansible.builtin.command:
+    argv: [readlink, -f, "{{ item.target }}"]
+  loop: "{{ stow_key_links }}"
+  loop_control:
+    label: "{{ item.target }}"
+  register: verify_stow_links
+  changed_when: false
+  failed_when: false
+
+- name: Assert final user, services, hardening, and Stow state
+  ansible.builtin.assert:
+    that:
+      - "'wheel' in verify_id.stdout"
+      - "'docker' in verify_id.stdout"
+      - "verify_sudoers_content.stdout == admin_user ~ ' ALL=(ALL:ALL) ALL'"
+      - verify_doas_content.stdout == 'permit persist ' ~ admin_user ~ ' as root'
+      - "'Status: active' in verify_ufw.stdout"
+      - (effective_ssh_port | string) in verify_ufw.stdout
+      - "'Status for the jail: sshd' in verify_fail2ban.stdout"
+      - "'nftables-multiport' in verify_fail2ban_actions.stdout"
+      - admin_ips | reject('in', verify_fail2ban_ignoreip.stdout) | list | length == 0
+      - "'permitrootlogin no' in (verify_sshd_effective.stdout_lines | map('lower'))"
+      - "'passwordauthentication no' in (verify_sshd_effective.stdout_lines | map('lower'))"
+      - "'pubkeyauthentication yes' in (verify_sshd_effective.stdout_lines | map('lower'))"
+
+- name: Assert every key Stow path resolves to its repository source
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - item.stdout == item.item.source
+    fail_msg: "Bad Stow link: {{ item.item.target }}"
+  loop: "{{ verify_stow_links.results }}"
+  loop_control:
+    label: "{{ item.item.target }}"
+
+- name: Print the final role check table
+  ansible.builtin.debug:
+    msg: |
+      STATUS: PASS
+      role         checks                                                     result
+      users       liam exists; wheel and docker groups; sudoers valid        PASS
+      privilege   doas.conf parses and matches the managed rule               PASS
+      packages    official, AUR, base-devel, yay                             PASS
+      docker      unprivileged info and hello-world                           PASS
+      dotfiles    key Stow symlinks resolve to ~/dotfiles                     PASS
+      ssh         syntax, effective policy, fresh liam key connection         PASS
+      ufw         active; rate-limited configured SSH port present            PASS
+      fail2ban    sshd jail active with nftables action                       PASS
+
+- name: Print actual verification command output
+  ansible.builtin.debug:
+    msg: |
+      $ id {{ admin_user }}
+      {{ verify_id.stdout }}
+
+      $ visudo -cf /etc/sudoers
+      {{ verify_sudoers.stdout }}
+
+      $ cat /etc/sudoers.d/{{ admin_user }}
+      {{ verify_sudoers_content.stdout }}
+
+      $ doas -C /etc/doas.conf
+      rc={{ verify_doas.rc }}
+
+      $ cat /etc/doas.conf
+      {{ verify_doas_content.stdout }}
+
+      $ yay --version
+      {{ verify_yay.stdout }}
+
+      $ pacman -Q <configured packages>
+      configured official={{ official_packages | join(' ') }}
+      configured AUR={{ aur_packages | join(' ') }}
+      {{ verify_packages.stdout }}
+
+      $ pacman -Qi base-devel
+      {{ verify_base_devel.stdout }}
+
+      $ docker info  # become_user={{ admin_user }}
+      {{ verify_docker_info.stdout }}
+
+      $ docker run --rm hello-world  # become_user={{ admin_user }}
+      {{ verify_docker_hello.stdout }}
+
+      $ sshd -t
+      rc={{ verify_sshd_syntax.rc }} stdout={{ verify_sshd_syntax.stdout | default('') }}
+
+      $ sshd -T  # managed settings only
+      {{ verify_sshd_effective.stdout_lines
+         | select('match', '(?i)^(port|permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication|maxauthtries|x11forwarding|allowagentforwarding|clientaliveinterval|clientalivecountmax) ')
+         | join('\n') }}
+
+      $ {{ final_ssh_validation_argv | join(' ') }}
+      {{ verify_ssh_connection.stdout }}
+
+      $ ufw status verbose
+      {{ verify_ufw.stdout }}
+
+      $ fail2ban-client status sshd
+      {{ verify_fail2ban.stdout }}
+
+      $ fail2ban-client get sshd actions
+      {{ verify_fail2ban_actions.stdout }}
+
+      $ fail2ban-client get sshd ignoreip
+      {{ verify_fail2ban_ignoreip.stdout }}
+
+      Verified Stow symlinks:
+      {{ verify_stow_links.results
+         | map(attribute='item.target')
+         | join('\n') }}
+
+      Password:
+      {{ 'vault hash is applied by the final task of this play'
+         if admin_password_hash | length > 0
+         else 'skipped; vault_liam_password_hash was not supplied' }}

@@ -1,0 +1,112 @@
+---
+- name: Install Docker Engine, Compose, and Buildx
+  community.general.pacman:
+    name: "{{ docker_packages }}"
+    state: present
+
+- name: Read the running kernel release before Docker networking is enabled
+  ansible.builtin.command:
+    argv: [uname, -r]
+  register: docker_running_kernel
+  changed_when: false
+
+- name: Check that modules exist for the running kernel
+  ansible.builtin.stat:
+    path: "/usr/lib/modules/{{ docker_running_kernel.stdout }}"
+  register: docker_running_kernel_modules
+
+- name: Require a reboot when an upgrade replaced the running kernel modules
+  ansible.builtin.assert:
+    that:
+      - docker_running_kernel_modules.stat.isdir | default(false)
+    fail_msg: >-
+      Docker provisioning stopped before changing Docker state because the
+      running kernel ({{ docker_running_kernel.stdout }}) has no matching
+      module tree. A full Arch upgrade replaced the kernel modules. Reboot the
+      host, then rerun this playbook with --tags docker.
+
+- name: Verify the nftables control plane before Docker creates NAT rules
+  ansible.builtin.command:
+    argv: [nft, list, ruleset]
+  register: docker_nftables_probe
+  changed_when: false
+  failed_when: false
+
+- name: Require a working nftables control plane for Docker networking
+  ansible.builtin.assert:
+    that:
+      - docker_nftables_probe.rc == 0
+    fail_msg: >-
+      Docker provisioning stopped before enabling docker.service because
+      nftables is not usable on this host: {{ docker_nftables_probe.stderr |
+      default(docker_nftables_probe.stdout, true) }}. Reboot after a kernel
+      upgrade and rerun. If this persists after reboot, repair the host's
+      kernel/nftables installation; do not disable Docker iptables support.
+
+- name: Ensure the docker group exists
+  ansible.builtin.group:
+    name: docker
+    state: present
+
+# Security: docker group members are effectively root. This is acceptable for
+# this personal workstation; remove the membership on a reused multi-user host.
+# Rollback: `gpasswd -d liam docker`, then log out all liam sessions.
+- name: Add liam to the root-equivalent docker group
+  ansible.builtin.user:
+    name: "{{ admin_user }}"
+    groups: docker
+    append: true
+
+# Supplementary groups are fixed at login; the SSH session Ansible is already
+# holding predates the group change above and cannot see docker. Because
+# ansible_user and become_user are both liam, Ansible skips sudo entirely
+# (verified: SUDO_USER is empty under `become_user: liam`), so the docker
+# checks below run in that stale session and hit EACCES on the socket. Dropping
+# the connection forces a fresh login with fresh initgroups.
+# Unconditional on purpose: `when` is unreliable on meta tasks, and a reconnect
+# costs one SSH handshake.
+# Rollback: delete this task; the docker checks then fail on first provision
+# and only pass on a later rerun.
+- name: Reconnect so the new docker group membership is in the session
+  ansible.builtin.meta: reset_connection
+
+- name: Read the session group membership Docker access depends on
+  ansible.builtin.command:
+    argv: [id, -nG]
+  become_user: "{{ admin_user }}"
+  register: docker_session_groups
+  changed_when: false
+
+- name: Require docker in liam's live session before testing the socket
+  ansible.builtin.assert:
+    that:
+      - "'docker' in docker_session_groups.stdout.split()"
+    fail_msg: >-
+      liam is not in the docker group in this session
+      (id -nG = {{ docker_session_groups.stdout }}). The membership was added
+      but the connection still predates it, so the reconnect above did not take
+      effect. Rerun the playbook; do not relax the socket permissions.
+
+- name: Enable and start Docker
+  ansible.builtin.systemd_service:
+    name: docker.service
+    enabled: true
+    state: started
+
+- name: Verify Docker is reachable by liam without sudo
+  ansible.builtin.command:
+    argv: [docker, info]
+  become_user: "{{ admin_user }}"
+  environment:
+    HOME: "{{ admin_home }}"
+  register: docker_info_output
+  changed_when: false
+
+- name: Run the Docker hello-world smoke test as liam
+  ansible.builtin.command:
+    argv: [docker, run, --rm, hello-world]
+  become_user: "{{ admin_user }}"
+  environment:
+    HOME: "{{ admin_home }}"
+  register: docker_hello_output
+  changed_when: false

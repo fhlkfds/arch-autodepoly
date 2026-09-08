@@ -1,0 +1,61 @@
+---
+- name: Ensure the primary liam group exists
+  ansible.builtin.group:
+    name: "{{ admin_user }}"
+    state: present
+
+- name: Ensure workstation groups exist
+  ansible.builtin.group:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ workstation_groups }}"
+
+# Rollback for supplemental access only: remove an unwanted membership with
+# `gpasswd -d liam GROUP`. Do not remove wheel until another sudo path is tested.
+- name: Create the administrative user without changing its password
+  ansible.builtin.user:
+    name: "{{ admin_user }}"
+    home: "{{ admin_home }}"
+    create_home: true
+    shell: "{{ admin_shell }}"
+    group: "{{ admin_user }}"
+    groups: "{{ workstation_groups | join(',') }}"
+    append: true
+    state: present
+
+# The password is deliberately NOT set here. Rewriting /etc/shadow invalidates
+# the sudo password Ansible is currently using, so it runs as the final task of
+# the final play in site.yml instead.
+
+- name: Install the validated sudoers rule for liam
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/{{ admin_user }}"
+    content: "{{ admin_user }} ALL=(ALL:ALL) ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Verify liam group membership
+  ansible.builtin.command:
+    argv: [id, "{{ admin_user }}"]
+  register: users_id_output
+  changed_when: false
+
+- name: Verify sudo policy resolves for liam
+  ansible.builtin.command:
+    argv: [sudo, -l, -U, "{{ admin_user }}"]
+  register: users_sudo_output
+  changed_when: false
+
+- name: Assert liam belongs to wheel
+  ansible.builtin.assert:
+    that:
+      - "'wheel' in users_id_output.stdout"
+
+- name: Record password provisioning status
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Password hash applied from Ansible Vault.'
+         if admin_password_hash | length > 0
+         else 'No vault password hash supplied; password setting was skipped.' }}

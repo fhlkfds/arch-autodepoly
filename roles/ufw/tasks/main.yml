@@ -1,0 +1,74 @@
+---
+- name: Require SSH validation data before configuring UFW
+  ansible.builtin.assert:
+    that:
+      - effective_ssh_port is defined
+      - effective_ssh_port | int > 0
+      - effective_ssh_port | int < 65536
+    fail_msg: "Run the ssh role before the ufw role so the real SSH port is known."
+
+- name: Install UFW from the official Arch repository
+  community.general.pacman:
+    name: ufw
+    state: present
+
+- name: Rate-limit the configured SSH port before enabling UFW
+  community.general.ufw:
+    rule: limit
+    port: "{{ effective_ssh_port | string }}"
+    proto: tcp
+    comment: "Rate-limited SSH"
+
+- name: Configure optional LAN-only firewall rules
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto }}"
+    from_ip: "{{ item.from_ip }}"
+    comment: "{{ item.comment | default('Ansible-managed LAN service') }}"
+  loop: "{{ ufw_lan_rules }}"
+  loop_control:
+    label: "{{ item.from_ip }} -> {{ item.port }}/{{ item.proto }}"
+
+- name: Set the default incoming policy to deny
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+
+- name: Set the default outgoing policy to allow
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+
+# Rollback from a root console: `ufw disable`; the pre-existing SSH session is
+# kept open while the fresh post-firewall connection below is tested.
+- name: Enable UFW policy
+  community.general.ufw:
+    state: enabled
+
+- name: Enable and start the UFW service
+  ansible.builtin.systemd_service:
+    name: ufw.service
+    enabled: true
+    state: started
+
+- name: Show verbose UFW status
+  ansible.builtin.command:
+    argv: [ufw, status, verbose]
+  register: ufw_status_output
+  changed_when: false
+
+- name: Assert UFW is active and exposes the SSH port
+  ansible.builtin.assert:
+    that:
+      - "'Status: active' in ufw_status_output.stdout"
+      - (effective_ssh_port | string) in ufw_status_output.stdout
+
+- name: Verify fresh SSH key authentication after enabling UFW
+  ansible.builtin.command:
+    argv: "{{ ssh_validation_argv }}"
+  delegate_to: localhost
+  become: false
+  register: ssh_post_ufw_output
+  changed_when: false
+

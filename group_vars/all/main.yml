@@ -1,0 +1,224 @@
+---
+admin_user: liam
+admin_home: "/home/{{ admin_user }}"
+admin_shell: /usr/bin/zsh
+
+# Put these values in an encrypted vars file. An existing authorized_keys file
+# is accepted when vault_liam_authorized_key is empty.
+admin_password_hash: "{{ vault_liam_password_hash | default('') }}"
+admin_authorized_key: "{{ vault_liam_authorized_key | default('') }}"
+
+# Required before fail2ban can be enabled. Every entry is written into
+# jail.local's ignoreip, so fail2ban will never ban these sources. IPv4
+# addresses and CIDR ranges are both accepted.
+# Override from group_vars/all/vault.yml (which wins, being loaded after this
+# file) if you would rather not keep your network layout in a tracked file.
+admin_ips:
+  - 10.2.1.0/24
+  - 192.168.1.1
+  - 127.0.0.1
+  - 192.168.1.0/24
+
+# Used by the controller for fresh, non-multiplexed key-authentication checks.
+# Leave the identity file empty to use the controller's SSH agent/default keys.
+ssh_validation_host: >-
+  {{ '127.0.0.1' if (ansible_connection | default('ssh')) == 'local'
+     else (ansible_host | default(inventory_hostname)) }}
+ssh_validation_identity_file: ""
+ssh_allow_agent_forwarding: false
+
+workstation_groups:
+  - wheel
+  - video
+  - audio
+  - input
+  - storage
+  - optical
+  - lp
+
+official_packages:
+  - base-devel
+  - git
+  - stow
+  - sudo
+  - zsh
+  - curl
+  - openssh
+  - hyprland
+  - hyprpaper
+  - hypridle
+  - hyprlock
+  - hyprsunset
+  - hyprpolkitagent
+  - kitty
+  - rofi
+  - quickshell
+  - wl-clipboard
+  - cliphist
+  - libnotify
+  - python
+  - jq
+  - playerctl
+  - udiskie
+  - pipewire
+  - wireplumber
+  - networkmanager
+  - networkmanager-openvpn
+  - openvpn
+  - tailscale
+  - bluez-utils
+  - iputils
+  - polkit
+  - nautilus
+  - gnome-disk-utility
+  - spotify-launcher
+  - obsidian
+  - virt-manager
+  - libvirt
+  - qemu-full
+  - dnsmasq
+  - btop
+  - imv
+  - mpv
+  - zathura
+  - zathura-pdf-mupdf
+  - neovim
+  - grim
+  - slurp
+  - hyprpicker
+  - gpu-screen-recorder
+  - greetd
+  - greetd-regreet
+  - greetd-tuigreet
+  - satty
+  - ffmpeg
+  - imagemagick
+  - tesseract
+  - tesseract-data-eng
+  - v4l-utils
+  - ddcutil
+  - pam-u2f
+  - libfido2
+  - gnupg
+  - rust
+  - musl
+  - rust-musl
+  - socat
+  - freerdp
+  - yt-dlp
+  - libheif
+  - file
+  - libqalculate
+  - papirus-icon-theme
+  - ttf-jetbrains-mono-nerd
+  - noto-fonts
+  - noto-fonts-emoji
+  - eza
+  - zsh-syntax-highlighting
+  - zsh-autosuggestions
+  - fzf
+  - fastfetch
+  - cava
+  - wofi
+  - swaync
+  - pacman-contrib
+  - opendoas
+  - power-profiles-daemon
+  - brightnessctl
+  - zbar
+  - translate-shell
+  - python-gobject
+  - xdg-desktop-portal
+  - xdg-desktop-portal-hyprland
+  - wtype
+  - gifski
+  - xdg-user-dirs
+  - vulkan-tools
+  - mesa-utils
+  - opencode
+
+aur_packages:
+  - brave-bin
+  - claude-code
+  - helium-browser-bin
+  - hermes-agent-desktop
+  - hyprvoice-bin
+  - localsend-bin
+  - looking-glass
+  - mpvpaper
+  - pokemon-colorscripts-git
+  # 2026-09-06: t3-code-git builds upstream HEAD and currently fails because
+  # Bun's frozen lockfile disagrees with package.json overrides. Use the
+  # upstream-maintained prebuilt AUR package instead; do not re-add -git
+  # unless that upstream source-build failure is resolved and re-verified.
+  - t3code-bin
+  - wl-screenrec-git
+  - xdg-terminal-exec
+
+docker_packages:
+  - docker
+  - docker-compose
+  - docker-buildx
+
+dotfiles_repo_url: https://github.com/fhlkfds/dotfiles.git
+dotfiles_repo_version: main
+dotfiles_repo_path: "{{ admin_home }}/dotfiles"
+stow_packages:
+  - ai
+  - browser
+  - cliphist
+  - fastfetch
+  - greeter
+  - hypr
+  - hyprlock
+  - kitty
+  - menu
+  - modes
+  - noctalia
+  - quickshell
+  - rofi
+  - screensaver
+  - security
+  - swaync
+  - systemd
+  - wallpaper
+  - windows
+  - wofi
+  - xdg
+  - zsh
+
+stow_key_links:
+  - target: "{{ admin_home }}/.zshrc"
+    source: "{{ dotfiles_repo_path }}/zsh/.zshrc"
+  - target: "{{ admin_home }}/.config/hypr/hyprland.lua"
+    source: "{{ dotfiles_repo_path }}/hypr/.config/hypr/hyprland.lua"
+  - target: "{{ admin_home }}/.config/quickshell/shell.qml"
+    source: "{{ dotfiles_repo_path }}/quickshell/.config/quickshell/shell.qml"
+  - target: "{{ admin_home }}/.config/kitty/kitty.conf"
+    source: "{{ dotfiles_repo_path }}/kitty/.config/kitty/kitty.conf"
+  - target: "{{ admin_home }}/.local/bin/desktop-mode"
+    source: "{{ dotfiles_repo_path }}/modes/.local/bin/desktop-mode"
+  - target: "{{ admin_home }}/.local/bin/ascii-screensaver"
+    source: "{{ dotfiles_repo_path }}/screensaver/.local/bin/ascii-screensaver"
+  - target: "{{ admin_home }}/.config/systemd/user/hypr-monitor-watch.service"
+    source: "{{ dotfiles_repo_path }}/systemd/.config/systemd/user/hypr-monitor-watch.service"
+
+# Only used to bootstrap the login screen theme on a fresh box that has never
+# run `theme set`; an existing theme choice always takes priority.
+greeter_theme_slug: tokyo-night
+greeter_service_user: greeter
+
+oh_my_zsh_repo_url: https://github.com/ohmyzsh/ohmyzsh.git
+powerlevel10k_repo_url: https://github.com/romkatv/powerlevel10k.git
+fzf_tab_repo_url: https://github.com/Aloxaf/fzf-tab.git
+ttfx_repo_url: https://github.com/omacom-io/ttfx
+ttfx_git_rev: 7203e354498462064b7c0a89375051f65cf2ce99
+
+fail2ban_bantime: 1h
+fail2ban_findtime: 10m
+fail2ban_maxretry: 5
+
+# Example:
+# ufw_lan_rules:
+#   - { port: "1714:1764", proto: udp, from_ip: "192.168.1.0/24", comment: "KDE Connect LAN" }
+ufw_lan_rules: []

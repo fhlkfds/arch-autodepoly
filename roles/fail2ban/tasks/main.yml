@@ -1,0 +1,53 @@
+---
+- name: Refuse to enable fail2ban without the administrator whitelist
+  ansible.builtin.assert:
+    that:
+      - admin_ips | length > 0
+      - >-
+        admin_ips | select('match', '^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$') | list | length
+        == (admin_ips | length)
+    fail_msg: >-
+      Set admin_ips to your controller/admin addresses or CIDR ranges. fail2ban
+      remains disabled until they are explicitly whitelisted.
+      Current value: {{ admin_ips | default('<undefined>') }}.
+
+- name: Install fail2ban from the official Arch repository
+  community.general.pacman:
+    name: fail2ban
+    state: present
+
+- name: Install the nftables-backed sshd jail with the admin whitelist
+  ansible.builtin.template:
+    src: jail.local.j2
+    dest: /etc/fail2ban/jail.local
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart fail2ban after validated configuration changes
+
+- name: Validate the complete fail2ban configuration before service changes
+  ansible.builtin.command:
+    argv: [fail2ban-client, -t]
+  changed_when: false
+
+# Rollback from a root console: `systemctl disable --now fail2ban`, then remove
+# jail.local. The admin address is rendered before the service can be enabled.
+- name: Enable and start fail2ban after writing the whitelist
+  ansible.builtin.systemd_service:
+    name: fail2ban.service
+    enabled: true
+    state: started
+
+- name: Apply a changed fail2ban jail now
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify the fail2ban sshd jail
+  ansible.builtin.command:
+    argv: [fail2ban-client, status, sshd]
+  register: fail2ban_status_output
+  changed_when: false
+
+- name: Assert the sshd jail is active
+  ansible.builtin.assert:
+    that:
+      - "'Status for the jail: sshd' in fail2ban_status_output.stdout"

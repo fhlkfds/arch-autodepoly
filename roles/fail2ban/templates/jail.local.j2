@@ -1,0 +1,12 @@
+[DEFAULT]
+banaction = nftables-multiport
+ignoreip = 127.0.0.1/8 ::1 {{ admin_ips | join(' ') }}
+
+[sshd]
+enabled = true
+port = {{ effective_ssh_port }}
+backend = systemd
+bantime = {{ fail2ban_bantime }}
+findtime = {{ fail2ban_findtime }}
+maxretry = {{ fail2ban_maxretry }}
+

@@ -1,0 +1,12 @@
+# Managed by Ansible. Local overrides must be reviewed against sshd's
+# first-value-wins rule before this file is changed.
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+KbdInteractiveAuthentication no
+MaxAuthTries 3
+X11Forwarding no
+AllowAgentForwarding {{ 'yes' if ssh_allow_agent_forwarding else 'no' }}
+ClientAliveInterval 300
+ClientAliveCountMax 2
+

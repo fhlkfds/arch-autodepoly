@@ -1,0 +1,123 @@
+---
+- name: Bootstrap the Arch workstation
+  hosts: arch_workstation
+  become: true
+  # A minimal Arch install may not have Python yet. Fact gathering must wait
+  # until the raw bootstrap below has installed it.
+  gather_facts: false
+  pre_tasks:
+    # Exception to the module-only rule: raw is required because every normal
+    # Ansible module, including pacman and setup, needs remote Python first.
+    # Rollback: this only installs/upgrades the official python package; the
+    # normal package role performs the same full upgrade idempotently later.
+    - name: Bootstrap Python before Ansible modules run
+      ansible.builtin.raw: |
+        if [ -x /usr/bin/python3 ]; then
+          printf '%s\n' python-present
+          exit 0
+        fi
+        if [ ! -x /usr/bin/pacman ]; then
+          printf '%s\n' 'pacman-not-found' >&2
+          exit 127
+        fi
+        /usr/bin/pacman -Syu --needed --noconfirm python
+        printf '%s\n' python-installed
+      register: python_bootstrap
+      changed_when: "'python-installed' in python_bootstrap.stdout"
+      check_mode: false
+      tags: [always]
+
+    - name: Reconnect after installing the Python interpreter
+      ansible.builtin.meta: reset_connection
+      tags: [always]
+
+    - name: Gather facts after Python bootstrap
+      ansible.builtin.setup:
+      tags: [always]
+
+    - name: Refuse to run on a non-Arch host
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == "Archlinux"
+        fail_msg: "This playbook supports Arch Linux only."
+      tags: [always]
+
+    - name: Refuse the upstream ttfx build on unsupported CPU architectures
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.architecture == "x86_64"
+        fail_msg: >-
+          The dotfiles install-ttfx helper pins x86_64-unknown-linux-musl;
+          review that helper before provisioning another architecture.
+      tags: [always]
+
+  roles:
+    # `always` keeps the mandatory user bootstrap ahead of every tagged run.
+    - role: users
+      tags: [users, always]
+    - role: packages
+      tags: [packages]
+    - role: docker
+      tags: [docker]
+    - role: dotfiles
+      tags: [dotfiles]
+    - role: greeter
+      tags: [greeter]
+
+- name: Harden SSH before changing the firewall
+  hosts: arch_workstation
+  become: true
+  gather_facts: false
+  serial: 1
+  roles:
+    - role: ssh
+      tags: [ssh]
+
+- name: Enable the host firewall and SSH banning
+  hosts: arch_workstation
+  become: true
+  gather_facts: false
+  serial: 1
+  pre_tasks:
+    - name: Require the fail2ban administrator whitelist before firewall changes
+      ansible.builtin.assert:
+        that:
+          - admin_ips | length > 0
+          - >-
+            admin_ips | select('match', '^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$') | list | length
+            == (admin_ips | length)
+        fail_msg: >-
+          Set admin_ips to at least one IPv4 address or CIDR range before the
+          firewall play; every entry must be a bare address or address/prefix.
+          Current value: {{ admin_ips | default('<undefined>') }}. No UFW or
+          fail2ban changes have been made by this play.
+      tags: [fail2ban]
+  roles:
+    - role: ufw
+      tags: [ufw]
+    - role: fail2ban
+      tags: [fail2ban]
+
+- name: Verify the provisioned workstation
+  hosts: arch_workstation
+  become: true
+  gather_facts: false
+  roles:
+    - role: verification
+      tags: [verification]
+  # Deliberately the last task of the last play. update_password: always
+  # rewrites /etc/shadow, which invalidates the --ask-become-pass value Ansible
+  # is using for sudo the moment it runs. Anywhere earlier and every subsequent
+  # become fails with "Incorrect sudo password", leaving a half-provisioned
+  # host. Placed here, a hash rotation costs nothing: the run completes, and the
+  # next run simply needs the new password.
+  # Rollback: set the password by hand at the console with `passwd liam`.
+  post_tasks:
+    - name: Set the administrative password from the vault hash
+      ansible.builtin.user:
+        name: "{{ admin_user }}"
+        password: "{{ admin_password_hash }}"
+        update_password: always
+      when: admin_password_hash | length > 0
+      no_log: true
+      tags: [users, password]

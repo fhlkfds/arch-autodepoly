@@ -1,0 +1,9 @@
+---
+# Rollback from an active root console: remove
+# /etc/ssh/sshd_config.d/99-ansible-hardening.conf, run `sshd -t`, then restart
+# sshd. Never stop sshd; a restart leaves existing sessions intact.
+- name: Restart sshd after validated configuration changes
+  ansible.builtin.systemd_service:
+    name: sshd.service
+    state: restarted
+
