@@ -38,6 +38,50 @@
     name: "{{ official_packages }}"
     state: present
 
+# virt-manager connects to qemu:///system through libvirt's system socket. The
+# packages do not enable that daemon, and the socket is restricted to root and
+# the libvirt group. Configure both pieces here so a fresh login can use the
+# connection without running virt-manager as root.
+- name: Ensure the libvirt access group exists
+  ansible.builtin.group:
+    name: libvirt
+    state: present
+
+- name: Add the administrative user to the libvirt group
+  ansible.builtin.user:
+    name: "{{ admin_user }}"
+    groups: libvirt
+    append: true
+
+# Supplementary groups are fixed at login. Refresh the Ansible connection so
+# the verification below tests the same access virt-manager gets after login.
+- name: Reconnect after adding libvirt group membership
+  ansible.builtin.meta: reset_connection
+
+- name: Enable and start the libvirt system daemon
+  ansible.builtin.systemd_service:
+    name: libvirtd.service
+    enabled: true
+    state: started
+
+- name: Verify the system QEMU libvirt connection as the administrator
+  ansible.builtin.command:
+    argv: [virsh, -c, qemu:///system, uri]
+  become_user: "{{ admin_user }}"
+  register: libvirt_system_uri
+  changed_when: false
+  failed_when: >-
+    libvirt_system_uri.rc != 0 or
+    libvirt_system_uri.stdout | trim != 'qemu:///system'
+
+# Install and run the Tailscale daemon, but do not authenticate this host. The
+# tailnet login is device-specific and must remain an interactive user action.
+- name: Enable and start the Tailscale daemon
+  ansible.builtin.systemd_service:
+    name: tailscaled.service
+    enabled: true
+    state: started
+
 # opendoas ships no default configuration, and the stowed zsh dotfiles set
 # `alias sudo='doas'` (dotfiles zsh/.zshrc), so without this file every
 # interactive `sudo ...` on the host fails with
@@ -390,6 +434,37 @@
     HOME: "{{ admin_home }}"
   args:
     creates: "{{ admin_home }}/.config/user-dirs.dirs"
+
+- name: Ensure the user-local executable directory exists
+  ansible.builtin.file:
+    path: "{{ admin_home }}/.local/bin"
+    state: directory
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0755"
+
+- name: Check for the wallhaven downloader source
+  ansible.builtin.stat:
+    path: "{{ wallhaven_dl_source }}"
+  register: wallhaven_dl_source_stat
+
+- name: Require the wallhaven downloader source checkout
+  ansible.builtin.assert:
+    that:
+      - wallhaven_dl_source_stat.stat.isreg | default(false)
+      - wallhaven_dl_source_stat.stat.executable | default(false)
+    fail_msg: >-
+      {{ wallhaven_dl_source }} must exist and be executable before its
+      user-local command link can be created.
+
+- name: Link wallhaven-dl into the user-local executable directory
+  ansible.builtin.file:
+    src: "{{ wallhaven_dl_source }}"
+    dest: "{{ wallhaven_dl_link }}"
+    state: link
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    force: false
 
 - name: Probe the repository-documented ttfx static binary
   ansible.builtin.command:

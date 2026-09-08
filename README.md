@@ -147,10 +147,18 @@ because every other role depends on the account and group state. Avoid running
 `ufw` or `fail2ban` alone; they require the SSH role's discovered port and
 successful key check.
 
-No desktop, NetworkManager, libvirt, user unit, or Wayland service is enabled.
+No desktop, NetworkManager, user unit, or Wayland service is enabled. The
+libvirt system daemon is enabled and started so virt-manager can connect to
+`qemu:///system`; `liam` is added to the `libvirt` group and the playbook checks
+that URI as the administrator. A new login is required for the group
+membership to apply to an already-open graphical session.
 Stow may place unit files in the home directory, but the playbook does not
 activate them. Only `docker.service`, `sddm.service`, `ufw.service`, and
-`fail2ban.service` are left enabled.
+`fail2ban.service`, and `libvirtd.service` are left enabled.
+
+`tailscaled.service` is also enabled and started, but the machine is not
+enrolled into a tailnet by Ansible. From the workstation, authenticate it with
+`sudo tailscale up` when you are ready.
 
 The login screen is SDDM showing a theme from
 [qylock](https://github.com/Darkkal44/qylock) (GPL-3.0), selected with

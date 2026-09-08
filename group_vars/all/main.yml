@@ -231,6 +231,9 @@ stow_key_links:
   - target: "{{ admin_home }}/.config/systemd/user/hypr-monitor-watch.service"
     source: "{{ dotfiles_repo_path }}/systemd/.config/systemd/user/hypr-monitor-watch.service"
 
+wallhaven_dl_source: "{{ admin_home }}/Projects/wallhaven-tools/wallhaven-dl"
+wallhaven_dl_link: "{{ admin_home }}/.local/bin/wallhaven-dl"
+
 # Only used to bootstrap the dotfiles theme on a fresh box that has never run
 # `theme set`; an existing theme choice always takes priority. This no longer
 # feeds the login screen, which is themed by sddm_theme below, but the greeter
