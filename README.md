@@ -18,10 +18,10 @@ ai browser cliphist fastfetch hypr hyprlock kitty modes noctalia quickshell
 rofi screensaver security swaync systemd windows Wallpapers wofi xdg zsh
 ```
 
-`docs`, `tests`, and `system` are explicitly excluded. `system` contains
-root-owned greetd and PAM examples, so this playbook does not Stow or install
-them; the login screen is SDDM rather than greetd in any case. `Wallpapers` is
-unusual: its files land directly in `$HOME`, matching the upstream warning. Stow runs with `--no-folding`, which makes every managed file
+`docs`, `tests`, and `system` are explicitly excluded. The playbook also omits
+the upstream `Wallpapers` package and stows `wallpaper` instead, matching the
+package directory that actually exists upstream. Stow runs with `--no-folding`,
+which makes every managed file
 an individually verifiable symlink.
 
 Before Stow runs, an existing target that does not already point into
