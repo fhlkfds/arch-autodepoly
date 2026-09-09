@@ -234,6 +234,17 @@ stow_key_links:
 wallhaven_dl_source: "{{ admin_home }}/Projects/wallhaven-tools/wallhaven-dl"
 wallhaven_dl_link: "{{ admin_home }}/.local/bin/wallhaven-dl"
 
+# fhlkfds/wallhaven-tools is a private repository, unlike the dotfiles, Oh My Zsh,
+# Powerlevel10k, fzf-tab and qylock repositories that every other role clones on the
+# target. A target-side clone is therefore not an option: there are no GitHub
+# credentials on the workstation, and ssh_allow_agent_forwarding is false, so an
+# SSH-URL clone cannot reach the private remote either. The controller already holds a
+# checkout, so the downloader is copied from there onto the target instead.
+# Override this if your checkout lives somewhere other than ~/Projects on the
+# controller. Rollback: `rm ~/.local/bin/wallhaven-dl` and the copied source.
+wallhaven_dl_controller_source: >-
+  {{ lookup('ansible.builtin.env', 'HOME') }}/Projects/wallhaven-tools/wallhaven-dl
+
 # Only used to bootstrap the dotfiles theme on a fresh box that has never run
 # `theme set`; an existing theme choice always takes priority. This no longer
 # feeds the login screen, which is themed by sddm_theme below, but the greeter

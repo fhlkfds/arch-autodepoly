@@ -443,19 +443,45 @@
     group: "{{ admin_user }}"
     mode: "0755"
 
-- name: Check for the wallhaven downloader source
+# wallhaven-tools is private, so this is the one external source the target cannot
+# clone for itself; it is copied from the controller's checkout instead. See the
+# wallhaven_dl_controller_source comment in group_vars/all/main.yml for why.
+- name: Check for the wallhaven downloader source on the controller
   ansible.builtin.stat:
-    path: "{{ wallhaven_dl_source }}"
+    path: "{{ wallhaven_dl_controller_source }}"
   register: wallhaven_dl_source_stat
+  delegate_to: localhost
+  become: false
 
-- name: Require the wallhaven downloader source checkout
+- name: Require the wallhaven downloader source checkout on the controller
   ansible.builtin.assert:
     that:
       - wallhaven_dl_source_stat.stat.isreg | default(false)
       - wallhaven_dl_source_stat.stat.executable | default(false)
     fail_msg: >-
-      {{ wallhaven_dl_source }} must exist and be executable before its
-      user-local command link can be created.
+      {{ wallhaven_dl_controller_source }} must exist on the controller and be
+      executable before it can be copied to {{ wallhaven_dl_source }} and linked.
+      fhlkfds/wallhaven-tools is a private repository, so the target cannot clone
+      it: check the repository out on the controller, or set
+      wallhaven_dl_controller_source to wherever your checkout lives.
+
+- name: Ensure the wallhaven downloader directory exists
+  ansible.builtin.file:
+    path: "{{ wallhaven_dl_source | dirname }}"
+    state: directory
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0755"
+
+# Mode is set explicitly rather than inherited: the link below is only worth
+# creating over a file the shell can actually execute.
+- name: Copy the wallhaven downloader from the controller checkout
+  ansible.builtin.copy:
+    src: "{{ wallhaven_dl_controller_source }}"
+    dest: "{{ wallhaven_dl_source }}"
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0755"
 
 - name: Link wallhaven-dl into the user-local executable directory
   ansible.builtin.file:
