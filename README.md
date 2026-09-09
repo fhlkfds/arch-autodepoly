@@ -32,7 +32,7 @@ changes are never overwritten.
 
 ## Package inventory
 
-Official repository packages are declared in `group_vars/all.yml`. The list
+Official repository packages are declared in `group_vars/all/main.yml`. The list
 includes the base toolchain, Hyprland and its active Quickshell stack, shell and
 font dependencies, capture tools, retained Wofi/SwayNC/Noctalia components,
 browser helpers, virtualization clients, Docker dependencies used by the
