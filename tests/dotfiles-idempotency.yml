@@ -5,7 +5,7 @@
   become: false
   gather_facts: true
   vars_files:
-    - ../group_vars/all.yml
+    - ../group_vars/all/main.yml
   vars:
     admin_user: liam
   pre_tasks:
