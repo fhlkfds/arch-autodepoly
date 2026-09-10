@@ -14,7 +14,7 @@ grep -q 'wallhaven_dl_source: "{{ admin_home }}/Projects/wallhaven-tools/wallhav
   || fail 'wallhaven-dl source path is not configured'
 grep -q 'wallhaven_dl_link: "{{ admin_home }}/.local/bin/wallhaven-dl"' "$vars_file" \
   || fail 'wallhaven-dl link path is not configured'
-grep -q '^wallhaven_tools_repo_url: git@github.com:fhlkfds/wallhaven-tools.git$' "$vars_file" \
+grep -q '^wallhaven_tools_repo_url: https://github.com/fhlkfds/wallhaven-tools.git$' "$vars_file" \
   || fail 'wallhaven-tools repository is not configured'
 grep -q 'path: "{{ admin_home }}/.local/bin"' "$packages_tasks" \
   || fail 'package role must create the user-local executable directory'
