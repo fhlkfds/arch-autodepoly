@@ -233,6 +233,8 @@ stow_key_links:
 
 wallhaven_dl_source: "{{ admin_home }}/Projects/wallhaven-tools/wallhaven-dl"
 wallhaven_dl_link: "{{ admin_home }}/.local/bin/wallhaven-dl"
+wallhaven_dl_controller_source: >-
+  {{ lookup('ansible.builtin.env', 'HOME') }}/Projects/wallhaven-tools/wallhaven-dl
 
 # Only used to bootstrap the dotfiles theme on a fresh box that has never run
 # `theme set`; an existing theme choice always takes priority. This no longer

@@ -443,19 +443,21 @@
     group: "{{ admin_user }}"
     mode: "0755"
 
-- name: Check for the wallhaven downloader source
-  ansible.builtin.stat:
-    path: "{{ wallhaven_dl_source }}"
-  register: wallhaven_dl_source_stat
+- name: Ensure the wallhaven downloader directory exists
+  ansible.builtin.file:
+    path: "{{ wallhaven_dl_source | dirname }}"
+    state: directory
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0755"
 
-- name: Require the wallhaven downloader source checkout
-  ansible.builtin.assert:
-    that:
-      - wallhaven_dl_source_stat.stat.isreg | default(false)
-      - wallhaven_dl_source_stat.stat.executable | default(false)
-    fail_msg: >-
-      {{ wallhaven_dl_source }} must exist and be executable before its
-      user-local command link can be created.
+- name: Copy the wallhaven downloader from the controller
+  ansible.builtin.copy:
+    src: "{{ wallhaven_dl_controller_source }}"
+    dest: "{{ wallhaven_dl_source }}"
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0755"
 
 - name: Link wallhaven-dl into the user-local executable directory
   ansible.builtin.file:
