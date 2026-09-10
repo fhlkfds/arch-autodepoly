@@ -89,8 +89,10 @@ ansible-vault encrypt group_vars/vault.yml
 
 `vault_liam_password_hash` must be a crypt-compatible password hash, never a
 plain password. If it is omitted, the password task is skipped and the final
-report says so. `vault_liam_authorized_key` may be omitted only when a valid key
-already exists in `/home/liam/.ssh/authorized_keys`.
+report says so. Local connections ensure `~/.ssh/id_ed25519` exists without
+replacing an existing key, then authorize it. Remote connections still require
+a vaulted key or a valid key already installed in
+`/home/liam/.ssh/authorized_keys`.
 
 `vault_admin_ip` is required. Fail2ban will not start until that IP or CIDR is in
 `ignoreip`. This is intentional. For a remote target, use the public source

@@ -17,6 +17,25 @@
     group: "{{ admin_user }}"
     mode: "0700"
 
+- name: Ensure a local SSH key exists
+  ansible.builtin.user:
+    name: "{{ admin_user }}"
+    generate_ssh_key: true
+    ssh_key_type: ed25519
+    ssh_key_file: .ssh/id_ed25519
+    force: false
+  register: local_ssh_key
+  when: (ansible_connection | default('ssh')) == 'local'
+
+- name: Authorize the generated local SSH key
+  ansible.posix.authorized_key:
+    user: "{{ admin_user }}"
+    key: "{{ local_ssh_key.ssh_public_key }}"
+    state: present
+    manage_dir: false
+    exclusive: false
+  when: (ansible_connection | default('ssh')) == 'local'
+
 - name: Install the vaulted administrative public key when supplied
   ansible.posix.authorized_key:
     user: "{{ admin_user }}"
