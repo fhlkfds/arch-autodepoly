@@ -35,16 +35,44 @@
   register: verify_yay
   changed_when: false
 
+# The packages role treats an AUR package that will not build after its whole
+# retry budget as UPSTREAM_BROKEN: it reports the package and provisioning
+# continues (roles/packages, aur_fail_hard defaults to false). Querying the
+# full aur_packages list here contradicts that contract and kills an otherwise
+# healthy run at the very last play, for the one failure mode the packages role
+# already decided was survivable. So verify what provisioning actually promised
+# to install, and account for the skipped remainder separately below.
+# `default([])` covers a tags-limited run such as `--tags verification`, where
+# the packages role never ran and never set the fact. Nothing was skipped from
+# this play's point of view, so every AUR package is expected and a genuinely
+# missing one still fails here.
+- name: Record which AUR packages provisioning promised to install
+  ansible.builtin.set_fact:
+    verify_skipped_aur_packages: "{{ aur_skipped_packages | default([]) }}"
+    verify_expected_aur_packages: >-
+      {{ aur_packages | difference(aur_skipped_packages | default([])) }}
+
 - name: Query all explicitly configured packages
   ansible.builtin.command:
     argv: >-
       {{ ['pacman', '-Q']
          + official_packages
-         + aur_packages
+         + verify_expected_aur_packages
          + docker_packages
          + ['ufw', 'fail2ban'] }}
   register: verify_packages
   changed_when: false
+
+# Not an assertion: a skipped package is expected to be absent, but an earlier
+# run may have installed it before upstream broke, so either answer is valid.
+# This records which it is so the report below states it rather than guesses.
+- name: Query the AUR packages that were skipped as unbuildable
+  ansible.builtin.command:
+    argv: "{{ ['pacman', '-Q'] + verify_skipped_aur_packages }}"
+  register: verify_skipped_aur_query
+  changed_when: false
+  failed_when: false
+  when: verify_skipped_aur_packages | length > 0
 
 # base-devel is a meta package, not a group: `pacman -Si base-devel` reports
 # "Groups: None", so `pacman -Qg base-devel` fails with "group not found".
@@ -173,16 +201,40 @@
 - name: Print the final role check table
   ansible.builtin.debug:
     msg: |
-      STATUS: PASS
+      STATUS: {{ 'PASS' if verify_skipped_aur_packages | length == 0
+                 else 'PASS WITH SKIPPED AUR PACKAGES' }}
       role         checks                                                     result
       users       liam exists; wheel and docker groups; sudoers valid        PASS
       privilege   doas.conf parses and matches the managed rule               PASS
-      packages    official, AUR, base-devel, yay                             PASS
+      packages    official, AUR, base-devel, yay                             {{
+        'PASS'
+        if verify_skipped_aur_packages | length == 0
+        else 'PASS (' ~ (verify_skipped_aur_packages | length) ~
+             ' AUR package(s) skipped by the packages role, not verified)' }}
       docker      unprivileged info and hello-world                           PASS
       dotfiles    key Stow symlinks resolve to ~/dotfiles                     PASS
       ssh         syntax, effective policy, fresh liam key connection         PASS
       ufw         active; rate-limited configured SSH port present            PASS
       fail2ban    sshd jail active with nftables action                       PASS
+
+# Last task of the run, so the skipped packages are the final thing on screen
+# rather than something buried mid-play by the packages role hundreds of lines
+# earlier. Verification passing must never let a missing package go unnoticed.
+- name: Restate the unverified AUR packages as the last word of the run
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['*** VERIFICATION PASSED, BUT ' ~ (verify_skipped_aur_packages | length) ~
+          ' AUR PACKAGE(S) ARE NOT INSTALLED ***']
+         + (verify_skipped_aur_packages
+            | map('regex_replace', '^(.+)$',
+                  '  \1: skipped by the packages role as unbuildable; install later with: yay -S \1')
+            | list)
+         + ['pacman -Q for those packages reported: ' ~
+            ((verify_skipped_aur_query.stderr | default('')) ~ ' ' ~
+             (verify_skipped_aur_query.stdout | default('')) | trim),
+            'Everything else in official_packages, aur_packages, docker_packages, ufw and fail2ban is installed and verified.',
+            'Set aur_fail_hard=true to make an unbuildable AUR package stop provisioning instead.'] }}
+  when: verify_skipped_aur_packages | length > 0
 
 - name: Print actual verification command output
   ansible.builtin.debug:
@@ -208,6 +260,8 @@
       $ pacman -Q <configured packages>
       configured official={{ official_packages | join(' ') }}
       configured AUR={{ aur_packages | join(' ') }}
+      verified AUR={{ verify_expected_aur_packages | join(' ') | default('none', true) }}
+      skipped AUR={{ verify_skipped_aur_packages | join(' ') | default('none', true) }}
       {{ verify_packages.stdout }}
 
       $ pacman -Qi base-devel
