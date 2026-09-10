@@ -443,21 +443,23 @@
     group: "{{ admin_user }}"
     mode: "0755"
 
-- name: Ensure the wallhaven downloader directory exists
+- name: Ensure the Projects directory exists
   ansible.builtin.file:
-    path: "{{ wallhaven_dl_source | dirname }}"
+    path: "{{ wallhaven_dl_source | dirname | dirname }}"
     state: directory
     owner: "{{ admin_user }}"
     group: "{{ admin_user }}"
     mode: "0755"
 
-- name: Copy the wallhaven downloader from the controller
-  ansible.builtin.copy:
-    src: "{{ wallhaven_dl_controller_source }}"
-    dest: "{{ wallhaven_dl_source }}"
-    owner: "{{ admin_user }}"
-    group: "{{ admin_user }}"
-    mode: "0755"
+- name: Clone the wallhaven tools
+  ansible.builtin.git:
+    repo: "{{ wallhaven_tools_repo_url }}"
+    dest: "{{ wallhaven_dl_source | dirname }}"
+    version: main
+    depth: 1
+    update: true
+    force: false
+  become_user: "{{ admin_user }}"
 
 - name: Link wallhaven-dl into the user-local executable directory
   ansible.builtin.file:

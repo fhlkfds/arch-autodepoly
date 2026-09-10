@@ -14,12 +14,12 @@ grep -q 'wallhaven_dl_source: "{{ admin_home }}/Projects/wallhaven-tools/wallhav
   || fail 'wallhaven-dl source path is not configured'
 grep -q 'wallhaven_dl_link: "{{ admin_home }}/.local/bin/wallhaven-dl"' "$vars_file" \
   || fail 'wallhaven-dl link path is not configured'
-grep -q '^wallhaven_dl_controller_source:' "$vars_file" \
-  || fail 'controller checkout path is not configured'
+grep -q '^wallhaven_tools_repo_url: git@github.com:fhlkfds/wallhaven-tools.git$' "$vars_file" \
+  || fail 'wallhaven-tools repository is not configured'
 grep -q 'path: "{{ admin_home }}/.local/bin"' "$packages_tasks" \
   || fail 'package role must create the user-local executable directory'
-grep -q 'dest: "{{ wallhaven_dl_source }}"' "$packages_tasks" \
-  || fail 'package role must copy the downloader onto a fresh target'
+grep -q 'repo: "{{ wallhaven_tools_repo_url }}"' "$packages_tasks" \
+  || fail 'package role must clone wallhaven-tools onto a fresh target'
 grep -q 'dest: "{{ wallhaven_dl_link }}"' "$packages_tasks" \
   || fail 'package role must create the wallhaven-dl link'
 grep -q 'force: false' "$packages_tasks" \
