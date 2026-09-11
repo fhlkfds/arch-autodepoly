@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""machi - workstation maintenance commands.
+
+Managed by Ansible (roles/snapshots). Do not edit in place; change the
+snapshots_*/machi_* variables and rerun the role.
+
+Subcommand groups are registered in COMMAND_GROUPS at the bottom, so adding a
+group later is one function and one entry. Today there is one: `snapshot`,
+a thin, legible wrapper around snapper. It deliberately does not reimplement
+anything snapper does; its job is to apply this host's policy (which snapper
+config, the free-space floor, whether the boot menu needs refreshing) so those
+decisions live in Ansible variables rather than in shell history.
+
+Privileges: `list` needs none, because the snapper config grants the users in
+ALLOW_USERS access over D-Bus. `create` and `cleanup` are attempted as the
+invoking user for the same reason and report exactly what to rerun with sudo if
+that access is missing. Nothing here escalates on its own.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+
+CONFIG_PATH = "{{ machi_config_path }}"
+
+# Written by Ansible; these are only the fallbacks for a missing config file.
+DEFAULTS = {
+    "snapper_config": "root",
+    "snapshot_mountpoint": "/.snapshots",
+    "root_subvolume": "@",
+    "min_free_gib": "20",
+    "boot_integration": "true",
+    "grub_btrfs_generator": "/etc/grub.d/41_snapshots-btrfs",
+    "grub_btrfsd_unit": "grub-btrfsd.service",
+}
+
+
+class Failure(Exception):
+    """An error with a message already written for the operator."""
+
+
+def load_config(path=CONFIG_PATH):
+    """Read the KEY=VALUE file Ansible writes. Unknown keys are ignored."""
+    config = dict(DEFAULTS)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                config[key.strip()] = value.strip().strip('"')
+    except FileNotFoundError:
+        print(
+            f"machi: {path} is missing, falling back to built-in defaults. "
+            "Rerun the snapshots role to restore it.",
+            file=sys.stderr,
+        )
+    return config
+
+
+def truthy(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def free_gib(path="/"):
+    """Free space in GiB. On btrfs this matches what df reports, which is an
+    estimate: compression and the unallocated pool both move the real figure.
+    It is the same number snapper's FREE_LIMIT works from."""
+    stats = os.statvfs(path)
+    return stats.f_bavail * stats.f_frsize / (1024 ** 3)
+
+
+def run(argv, check=True, capture=False):
+    # Python buffers its own stdout when it is a pipe, while a child process
+    # writes straight through, so without this flush `machi snapshot cleanup |
+    # less` prints the snapper tables first and this script's own headings
+    # afterwards.
+    sys.stdout.flush()
+    try:
+        result = subprocess.run(
+            argv,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+        )
+    except FileNotFoundError as error:
+        raise Failure(f"machi: {argv[0]} is not installed ({error}).") from error
+    if check and result.returncode != 0:
+        detail = (result.stderr or "").strip() if capture else ""
+        raise Failure(
+            f"machi: `{' '.join(argv)}` failed with exit status "
+            f"{result.returncode}." + (f"\n{detail}" if detail else "")
+        )
+    return result
+
+
+def snapper(config, *args, capture=False, check=True):
+    return run(["snapper", "--config", config["snapper_config"], *args],
+               capture=capture, check=check)
+
+
+def permission_hint(action):
+    """snapper refuses rather than prompts, so translate that into the exact
+    command to rerun. Nothing is escalated automatically."""
+    escalate = "sudo" if shutil.which("sudo") else "doas"
+    return (
+        f"machi: not permitted to {action} as {os.environ.get('USER', 'this user')}.\n"
+        f"  Rerun as: {escalate} machi snapshot {action}\n"
+        f"  Or add the user to ALLOW_USERS in /etc/snapper/configs/"
+        f"<config> via the snapshots_allow_users Ansible variable."
+    )
+
+
+def boot_menu_note(config, force=False):
+    """Keep the GRUB snapshot submenu honest after the snapshot set changes.
+
+    grub-btrfsd watches the snapshot directory and regenerates the submenu by
+    itself, so after a *creation* there is nothing to do. After a *deletion*
+    there is: the daemon regenerates on the first inotify event, and deleting a
+    snapshot is several filesystem operations, so it can rebuild the menu while
+    the subvolume still exists and then see no further event. That leaves an
+    entry for a snapshot that is gone, which fails to boot. Callers that delete
+    pass force=True to regenerate unconditionally."""
+    if not truthy(config["boot_integration"]):
+        return "Boot-menu integration is disabled; snapshot is not offered at boot."
+
+    generator = config["grub_btrfs_generator"]
+
+    if not force:
+        daemon = run(["systemctl", "is-active", "--quiet", config["grub_btrfsd_unit"]],
+                     check=False)
+        if daemon.returncode == 0:
+            return (f"{config['grub_btrfsd_unit']} is running and will add this to the "
+                    "GRUB snapshot submenu within a few seconds.")
+
+    if os.geteuid() != 0:
+        reason = ("the boot menu cannot be trusted to update itself after a deletion"
+                  if force else
+                  f"{config['grub_btrfsd_unit']} is not running")
+        return (f"GRUB snapshot submenu not refreshed: {reason}, and refreshing it "
+                f"needs root. Run: sudo {generator}")
+    if not os.path.exists(generator):
+        return (f"{generator} is missing, so the GRUB snapshot submenu cannot be "
+                "refreshed. Is grub-btrfs installed?")
+    result = run([generator], check=False, capture=True)
+    if result.returncode != 0:
+        return (f"Refreshing the GRUB snapshot submenu with {generator} failed: "
+                f"{(result.stderr or '').strip()}")
+    return "GRUB snapshot submenu regenerated."
+
+
+def snapshot_create(args, config):
+    floor = float(config["min_free_gib"])
+    available = free_gib()
+    if available < floor:
+        raise Failure(
+            f"machi: refusing to create a snapshot with {available:.1f} GiB free, "
+            f"below the {floor:.0f} GiB floor.\n"
+            "  A snapshot itself costs almost nothing, but it pins the space every\n"
+            "  later change would otherwise release, so taking one now is the wrong\n"
+            "  move on a nearly full filesystem.\n"
+            "  Reclaim space first:\n"
+            f"    machi snapshot cleanup\n"
+            "    sudo paccache -rk1\n"
+            "    sudo journalctl --vacuum-size=200M\n"
+            "  Or lower the floor with the snapshots_min_free_gib Ansible variable."
+        )
+
+    description = args.description or "manual snapshot (machi)"
+    argv = ["create", "--type", "single", "--print-number",
+            "--description", description,
+            "--userdata", "created_by=machi"]
+    # No --cleanup-algorithm unless asked for. A snapshot taken by hand is an
+    # explicit act, and tagging it "number" would let snapper-cleanup.timer
+    # rotate it out without anyone asking. Automatic pre-update snapshots are
+    # tagged by snap-pac and are the ones under retention.
+    if args.cleanup:
+        argv += ["--cleanup-algorithm", args.cleanup]
+
+    result = snapper(config, *argv, capture=True, check=False)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        if "permission" in stderr or "denied" in stderr or "authoriz" in stderr:
+            raise Failure(permission_hint("create"))
+        raise Failure(
+            "machi: snapper could not create the snapshot.\n"
+            f"  {(result.stderr or '').strip()}\n"
+            f"  Check that {config['snapshot_mountpoint']} is mounted "
+            "(findmnt " + config["snapshot_mountpoint"] + ") and that "
+            f"/etc/snapper/configs/{config['snapper_config']} exists."
+        )
+
+    number = (result.stdout or "").strip()
+    print(f"Created snapshot {number}: {description}")
+    if not args.cleanup:
+        print("  Retention: kept until deleted by hand "
+              "(no cleanup algorithm; it will not be rotated out).")
+    else:
+        print(f"  Retention: cleanup algorithm '{args.cleanup}'.")
+    print(f"  Free space: {free_gib():.1f} GiB.")
+    print(f"  {boot_menu_note(config)}")
+    return 0
+
+
+def snapshot_list(args, config):
+    snapper(config, "list")
+    print()
+    print(f"Store: {config['snapshot_mountpoint']}  "
+          f"Free space: {free_gib():.1f} GiB  "
+          f"Floor: {config['min_free_gib']} GiB")
+    if truthy(config["boot_integration"]):
+        print("Every snapshot above is offered under the snapshot submenu of the "
+              "GRUB menu at boot.")
+    return 0
+
+
+def snapshot_cleanup(args, config):
+    """Apply the retention policy. Never silent: it shows what exists, states
+    the policy, and asks before deleting anything."""
+    print("Snapshots before cleanup:")
+    snapper(config, "list")
+    print()
+
+    policy = run(["snapper", "--config", config["snapper_config"], "get-config"],
+                 capture=True, check=False)
+    limits = [
+        line for line in (policy.stdout or "").splitlines()
+        if line.split("│")[0].strip().startswith(("NUMBER_", "TIMELINE_LIMIT", "EMPTY_PRE_POST"))
+    ]
+    if limits:
+        print("Retention policy that will be applied:")
+        for line in limits:
+            print(f"  {line.strip()}")
+        print()
+
+    print("Only snapshots tagged with the 'number' cleanup algorithm are eligible;")
+    print("snapshots created by `machi snapshot create` are not touched.")
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise Failure(
+                "machi: refusing to delete snapshots without confirmation. "
+                "Rerun with --yes in a non-interactive context."
+            )
+        answer = input("Apply this retention policy now? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Nothing was deleted.")
+            return 0
+
+    result = snapper(config, "cleanup", "number", capture=True, check=False)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        if "permission" in stderr or "denied" in stderr or "authoriz" in stderr:
+            raise Failure(permission_hint("cleanup"))
+        raise Failure("machi: snapper cleanup failed.\n"
+                      f"  {(result.stderr or '').strip()}")
+
+    print()
+    print("Snapshots after cleanup:")
+    snapper(config, "list")
+    print()
+    print(f"Free space: {free_gib():.1f} GiB.")
+    # force: snapshots were deleted, so the menu cannot be left to the daemon.
+    print(f"  {boot_menu_note(config, force=True)}")
+    return 0
+
+
+def snapshot_space_check(args, config):
+    """Called from the pacman pre-transaction hook. Warns, never blocks: a full
+    disk is a reason to reclaim space, not a reason to refuse a security
+    update. Always exits 0 for that reason."""
+    floor = float(config["min_free_gib"])
+    available = free_gib()
+    if available < floor:
+        print(f"==> WARNING: {available:.1f} GiB free, below the {floor:.0f} GiB "
+              "snapshot floor.")
+        print("==> The pre-transaction snapshot will still be attempted, but "
+              "snapshots are now")
+        print("==> a real space risk. Run `machi snapshot cleanup` and "
+              "`sudo paccache -rk1`.")
+    return 0
+
+
+def add_snapshot_commands(subparsers):
+    group = subparsers.add_parser(
+        "snapshot", help="create, list and prune Btrfs snapshots of the root subvolume")
+    actions = group.add_subparsers(dest="action", metavar="ACTION")
+    actions.required = True
+
+    create = actions.add_parser("create", help="snapshot the root subvolume now")
+    create.add_argument("description", nargs="?", default=None,
+                        help='free-text description, e.g. "before nvidia driver swap"')
+    create.add_argument("--cleanup", choices=["number", "timeline"], default=None,
+                        help="subject this snapshot to automatic retention "
+                             "(default: keep until deleted by hand)")
+    create.set_defaults(func=snapshot_create)
+
+    listing = actions.add_parser("list", help="list existing snapshots")
+    listing.set_defaults(func=snapshot_list)
+
+    cleanup = actions.add_parser("cleanup", help="apply the retention policy, with confirmation")
+    cleanup.add_argument("--yes", action="store_true",
+                         help="skip the confirmation prompt")
+    cleanup.set_defaults(func=snapshot_cleanup)
+
+    space = actions.add_parser("space-check",
+                               help="warn if free space is below the snapshot floor "
+                                    "(used by the pacman hook)")
+    space.set_defaults(func=snapshot_space_check)
+
+
+COMMAND_GROUPS = [add_snapshot_commands]
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="machi",
+        description="Workstation maintenance commands for this Arch host.")
+    subparsers = parser.add_subparsers(dest="group", metavar="GROUP")
+    subparsers.required = True
+    for register in COMMAND_GROUPS:
+        register(subparsers)
+
+    args = parser.parse_args(argv)
+    config = load_config()
+    try:
+        return args.func(args, config)
+    except Failure as error:
+        print(error, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nmachi: interrupted; nothing was changed.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

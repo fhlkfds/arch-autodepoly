@@ -112,6 +112,18 @@ disabled during the run:
 workstation ansible_host=192.168.122.122 ansible_user=liam
 ```
 
+To provision the machine you are sitting at instead, use the local inventory,
+which runs the same plays over a local connection:
+
+```ini
+[arch_workstation]
+localhost ansible_connection=local ansible_user=liam
+```
+
+```bash
+ansible-playbook -i inventory/local.ini site.yml --ask-become-pass
+```
+
 Test the SSH connection before running Ansible:
 
 ```bash
@@ -213,6 +225,44 @@ or a live graphical session. The Codex CLI has no exact official/AUR package in
 the checked repositories, so the `ai` launcher will report it missing until it
 is installed by its upstream method.
 
+## Bootable Btrfs snapshots
+
+The root subvolume is snapshotted automatically before every pacman or AUR
+helper transaction that installs, upgrades or removes a package, and every
+snapshot is bootable from the *Arch Linux snapshots* submenu of the GRUB menu.
+Snapper is the engine, `snap-pac` provides the pacman hooks, and `grub-btrfs`
+generates the menu entries.
+
+```bash
+machi snapshot create "before nvidia swap"
+machi snapshot list
+machi snapshot cleanup
+```
+
+`list` and `create` need no `sudo`: `snapshots_allow_users` puts `liam` in the
+snapper config's `ALLOW_USERS`, so both work over snapper's D-Bus interface.
+
+The role added one top-level `@snapshots` subvolume mounted at `/.snapshots`,
+which is the only change it makes to `/etc/fstab` — one additive line, with the
+original kept at `/var/lib/arch-autodeploy/fstab.before-snapshots`. It also
+adds `grub-btrfs-overlayfs` to `HOOKS` in `/etc/mkinitcpio.conf`, without which
+a read-only snapshot reaches the kernel and then fails in early userspace.
+
+Two things worth knowing before relying on it:
+
+* `/boot` is a separate vfat EFI partition, so the kernel and initramfs live
+  outside every snapshot. A snapshot taken before a **kernel** upgrade
+  therefore boots the new kernel against its own older `/usr/lib/modules`. It
+  boots and gives you a shell to roll back from; it is not a working desktop.
+* `/var/lib/libvirt`, `/var/lib/containerd` and `/var/lib/docker` are inside
+  `@`, so they are captured by snapshots and reverted by a rollback. Retention
+  defaults are deliberately low because of the space that churn pins.
+
+Rolling back permanently is a manual, documented procedure — `snapper rollback`
+is not the right command for this subvolume layout. Retention, the free-space
+safeguards, the reboot test and troubleshooting are all in
+[docs/snapshots.md](docs/snapshots.md).
+
 ## Evidence and idempotency
 
 The verification play prints a pass/fail table followed by unedited command
@@ -244,6 +294,14 @@ previous `grub.cfg` goes to `/var/lib/arch-autodeploy/grub.cfg.previous` instead
 because `/boot` is a vfat EFI partition that rejects the colons in Ansible's
 timestamped backup names and cannot store an arbitrary mode. `grub.cfg` is
 regenerable anyway with `grub-mkconfig -o /boot/grub/grub.cfg`.
+
+If an update breaks the system, reboot, pick *Arch Linux snapshots* in the GRUB
+menu, and boot the `pre` snapshot from just before that transaction. That boot
+is throwaway — an overlay in RAM, discarded on the next reboot — so make it
+permanent with the rollback procedure in
+[docs/snapshots.md](docs/snapshots.md#rolling-back-permanently). `/etc/fstab`
+and `/etc/mkinitcpio.conf` are backed up in place, and the pre-snapshot
+`/etc/fstab` is also at `/var/lib/arch-autodeploy/fstab.before-snapshots`.
 
 To recover from a firewall mistake, run `ufw disable` from the console. To stop
 banning while preserving UFW, run `systemctl disable --now fail2ban`. Stow

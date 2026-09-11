@@ -1,0 +1,26 @@
+# {{ ansible_managed }}
+# Managed by Ansible (roles/snapshots). Do not edit by hand.
+#
+# Warns before a package transaction when the filesystem is too full for the
+# snapshot that snap-pac is about to take to be useful. Named to sort ahead of
+# 05-snap-pac-pre.hook, so the warning appears before the snapshot attempt.
+#
+# Deliberately has no AbortOnFail: a full disk should not stop a security
+# update from being installed. The guard that actually reclaims space is
+# snapper-cleanup.timer, and `machi snapshot create` refuses outright.
+#
+# The triggers mirror snap-pac's own, so this warns exactly when a snapshot is
+# attempted and stays quiet during a database-only `pacman -Sy`, a query, or a
+# download-only run.
+
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Checking free space for the pre-transaction snapshot...
+When = PreTransaction
+Exec = {{ machi_bin_path }} snapshot space-check

@@ -1,0 +1,23 @@
+# {{ ansible_managed }}
+# Managed by Ansible (roles/snapshots). Do not edit by hand.
+#
+# Regenerates the GRUB snapshot submenu after the daily cleanup has finished
+# deleting snapshots.
+#
+# grub-btrfsd watches {{ snapshots_mountpoint }} with
+# `inotifywait -e create -e delete` and regenerates on the first event it sees.
+# Deleting a snapshot is several filesystem operations, so the daemon can
+# regenerate while the subvolume still exists and then see no further event,
+# leaving a menu entry for a snapshot that is already gone. Selecting such an
+# entry fails to boot: the kernel cannot mount the missing subvolume.
+#
+# Creation does not have this problem (the snapshot is complete before the
+# directory appears), so the daemon is still what keeps the menu current for
+# new snapshots. This only closes the deletion path, which is the one the
+# retention policy exercises every day.
+#
+# ExecStartPost, not a separate unit, so it cannot run while cleanup is still
+# deleting. A failure here does not fail the cleanup: "-" prefixes the command.
+
+[Service]
+ExecStartPost=-{{ snapshots_grub_btrfs_generator }}

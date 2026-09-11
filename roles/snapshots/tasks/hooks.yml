@@ -1,0 +1,79 @@
+---
+# Automatic pre-update snapshots. The pacman hooks themselves are snap-pac's
+# (/usr/share/libalpm/hooks/05-snap-pac-pre.hook and zz-snap-pac-post.hook):
+# they are already correct, already trigger only on Type=Package with
+# Operation Install/Upgrade/Remove, and are maintained upstream. Reimplementing
+# them here would mean owning that trigger logic forever, so this only
+# configures them.
+#
+# Because every AUR helper installs through pacman, `yay -Syu` and
+# `yay -S <pkg>` go through the same hooks with no extra work. yay's own
+# `--devel` database refreshes do not, because they install nothing.
+
+- name: Configure the pacman pre/post snapshot hooks
+  ansible.builtin.template:
+    src: snap-pac.ini.j2
+    dest: /etc/snap-pac.ini
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  diff: true
+  register: snapshots_snap_pac_ini
+
+- name: Ensure the pacman hook directory exists
+  ansible.builtin.file:
+    path: "{{ machi_pacman_hook_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# alpm-hooks(5): a hook in HookDir shadows a same-named hook shipped under
+# /usr/share/libalpm/hooks, and a hook symlinked to /dev/null is skipped. That
+# is the supported way to switch off a packaged hook without deleting a file
+# pacman owns and would restore on the next upgrade.
+- name: Disable the post-transaction snapshot hook
+  ansible.builtin.file:
+    src: /dev/null
+    dest: "{{ machi_pacman_hook_path | dirname }}/zz-snap-pac-post.hook"
+    state: link
+    force: true
+  when: not (snapshots_snap_pac_post | bool)
+
+- name: Re-enable the post-transaction snapshot hook
+  ansible.builtin.file:
+    path: "{{ machi_pacman_hook_path | dirname }}/zz-snap-pac-post.hook"
+    state: absent
+  when: snapshots_snap_pac_post | bool
+
+- name: Install the pre-transaction free-space warning hook
+  ansible.builtin.template:
+    src: machi-space.hook.j2
+    dest: "{{ machi_pacman_hook_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - machi_space_hook_enabled | bool
+    - machi_enabled | bool
+
+- name: Remove the pre-transaction free-space warning hook
+  ansible.builtin.file:
+    path: "{{ machi_pacman_hook_path }}"
+    state: absent
+  when: not (machi_space_hook_enabled | bool and machi_enabled | bool)
+
+# pacman parses hooks with its own INI reader and fails the whole transaction
+# on a malformed one, so the file is proved here rather than at the next
+# upgrade. `pacman -Q` performs no transaction and triggers no hook, but it
+# does parse every hook file, which is exactly what needs checking.
+- name: Prove that pacman parses every installed hook
+  ansible.builtin.command:
+    argv: [pacman, -Q, pacman]
+  register: snapshots_hook_parse
+  changed_when: false
+  failed_when: >-
+    snapshots_hook_parse.rc != 0
+    or ('could not parse' in (snapshots_hook_parse.stderr | default('')))
+    or ('unable to read' in (snapshots_hook_parse.stderr | default('')))

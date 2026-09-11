@@ -1,0 +1,222 @@
+---
+# Bootable Btrfs snapshots: Snapper for the snapshots, snap-pac for the
+# pre/post pacman hooks, grub-btrfs for the boot menu entries. All three are in
+# the official repositories, which is why they were chosen over Timeshift (no
+# pacman integration) or a hand-rolled btrfs-send script (nothing to maintain
+# it). See docs/snapshots.md for the reasoning and the rollback procedure.
+
+# Master switch. false leaves every file this role manages untouched; it does
+# not uninstall anything already deployed. See "Disabling and uninstalling" in
+# docs/snapshots.md for the removal procedure.
+snapshots_enabled: true
+
+# --- Layout ------------------------------------------------------------------
+# This host uses the flat archinstall layout: @ (/), @home, @log, @pkg, all
+# top-level subvolumes of the same filesystem. The snapshot store is added in
+# the same style, as a top-level @snapshots mounted at /.snapshots, because:
+#
+#   * a nested @/.snapshots would be destroyed by the rollback procedure, which
+#     replaces @ wholesale, taking every snapshot with it;
+#   * nested subvolumes are not captured by `btrfs subvolume snapshot`, so a
+#     top-level store also keeps snapshots out of the snapshots.
+#
+# Adding it costs one additive /etc/fstab line. Nothing existing is rewritten:
+# the mount module appends, and the role backs the file up first.
+snapshots_subvolume_name: "@snapshots"
+snapshots_mountpoint: /.snapshots
+
+# Set to false on a host where /etc/fstab is managed elsewhere. The role then
+# expects snapshots_mountpoint to be mounted already and fails if it is not,
+# rather than writing snapshots into a plain directory inside @, which would
+# silently make them part of every later snapshot of @.
+snapshots_manage_fstab: true
+
+# The snapper configuration name. "root" is what snap-pac snapshots by default
+# and what grub-btrfs expects to find under /.snapshots.
+snapshots_config_name: root
+
+snapshots_packages:
+  - snapper
+  - snap-pac
+  - btrfs-progs
+  # Provides /etc/grub.d/41_snapshots-btrfs, grub-btrfsd and the
+  # grub-btrfs-overlayfs initcpio hook that makes a read-only snapshot bootable.
+  - grub-btrfs
+  # grub-btrfsd watches the snapshot directory with inotify.
+  - inotify-tools
+
+# --- Retention ---------------------------------------------------------------
+# snapper's "number" cleanup algorithm is what snap-pac tags its snapshots
+# with, so these are the limits that decide how many pre-update snapshots
+# survive. Each pacman transaction creates a pre/post pair, so a limit of 10
+# holds roughly the last five transactions.
+#
+# Deliberately far below snapper's shipped NUMBER_LIMIT of 50: about 127 GB of
+# this host's root subvolume is churn-heavy VM and container data
+# (/var/lib/libvirt, /var/lib/containerd, /var/lib/docker), and every retained
+# snapshot pins the extents those files overwrite. See the space section of
+# docs/snapshots.md.
+snapshots_number_limit: "10"
+
+# Snapshots tagged important=yes get their own, longer limit. snap-pac applies
+# that tag to the transactions listed in snapshots_important_packages and
+# snapshots_important_commands below.
+snapshots_number_limit_important: "5"
+
+# Nothing is deleted before this age, so a cleanup run triggered right after an
+# update cannot remove the snapshot that update just created. Seconds.
+snapshots_number_min_age: "3600"
+
+# Hourly timeline snapshots. Off by default: this is a desktop, the point of
+# the setup is the pre-update snapshot, and hourly snapshots of the churn-heavy
+# paths above are the fastest way to fill the filesystem. Set to true to enable
+# snapper-timeline.timer along with the limits below.
+snapshots_timeline_enabled: false
+snapshots_timeline_limits:
+  hourly: "5"
+  daily: "7"
+  weekly: "0"
+  monthly: "0"
+  quarterly: "0"
+  yearly: "0"
+
+# --- Free-space safeguards ---------------------------------------------------
+# Three independent guards, documented in docs/snapshots.md:
+#
+# 1. SPACE_LIMIT/FREE_LIMIT below, honoured by snapper's number and timeline
+#    cleanup: cleanup keeps deleting until snapshots occupy less than
+#    SPACE_LIMIT of the filesystem and at least FREE_LIMIT of it is free.
+#    Fractions of the filesystem size.
+# 2. snapshots_min_free_gib, enforced by `machi snapshot create` (which
+#    refuses) and by the pacman pre-transaction hook (which warns but never
+#    blocks an update).
+# 3. snapper-cleanup.timer, which applies 1. daily.
+snapshots_space_limit: "0.25"
+snapshots_free_limit: "0.25"
+snapshots_min_free_gib: 20
+
+# Enables snapper-cleanup.timer. Turning this off means nothing ever enforces
+# the retention limits above and the snapshot store grows without bound.
+snapshots_cleanup_timer_enabled: true
+
+# --- Access ------------------------------------------------------------------
+# Listed users can run `snapper -c root list/create` without root, through
+# snapperd on D-Bus, which is what lets `machi snapshot list` work unprivileged.
+# SYNC_ACL grants them read access to /.snapshots itself.
+snapshots_allow_users:
+  - "{{ admin_user }}"
+snapshots_sync_acl: true
+
+# --- Automatic pre-update snapshots -----------------------------------------
+# snap-pac ships the pacman hooks; this only configures them. Its triggers are
+# Type=Package with Operation Install/Upgrade/Remove, so a database-only
+# `pacman -Sy`, a query, or a download-only run creates nothing. yay and any
+# other AUR helper inherit this, because they all install through pacman.
+snapshots_auto_pre_update: true
+
+# The post snapshot closes the pre/post pair snapper needs for
+# `snapper status <pre>..<post>` (the file-level diff of a transaction) and for
+# EMPTY_PRE_POST_CLEANUP. Set to false to halve the number of snapshots kept at
+# the cost of losing both.
+snapshots_snap_pac_post: true
+
+# Descriptions. Left empty on purpose: snap-pac then uses its own defaults,
+# which are the pacman command line for the pre snapshot ("/usr/bin/pacman
+# -Syu", the transaction context) and the list of packages involved for the
+# post snapshot. Nothing else records either, and snapper stores the timestamp
+# and the "pre"/"post" type alongside, which is exactly what the GRUB menu
+# shows. Set these to a literal string to override, at the cost of losing that
+# context; snap-pac performs no placeholder substitution.
+snapshots_pre_description: ""
+snapshots_post_description: ""
+
+# Description length snapper stores. The GRUB menu truncates anyway; 72 is
+# snap-pac's default.
+snapshots_description_limit: 72
+
+# Transactions worth keeping longer, tagged important=yes by snap-pac and
+# retained under snapshots_number_limit_important. A kernel upgrade is the one
+# that most often needs backing out.
+snapshots_important_packages:
+  - linux
+  - linux-lts
+  - linux-firmware
+  - mkinitcpio
+  - grub
+  - systemd
+# Matched by snap-pac against the *entire* parent command line, exactly, so
+# "pacman -Syu" does not match "/usr/bin/pacman -Syu" and never matches an AUR
+# helper's internal pacman invocation. Left empty because
+# snapshots_important_packages above is the reliable half of this feature.
+snapshots_important_commands: []
+
+# --- Boot menu integration ---------------------------------------------------
+# false leaves GRUB alone entirely: snapshots are still created, just not
+# offered at boot.
+snapshots_boot_integration: true
+
+# /boot on this host is a separate vfat EFI system partition, so the kernel and
+# initramfs live outside every snapshot of @. grub-btrfs detects that by itself
+# (boot_separate()) and points snapshot entries at the ESP kernel. The
+# consequence, spelled out in docs/snapshots.md, is that a snapshot taken
+# before a kernel upgrade boots the *new* kernel against its own older
+# /usr/lib/modules.
+# CPU microcode image for the snapshot boot entries. Empty means detect it in
+# /boot, which is what this role does and what you want.
+#
+# grub-btrfs finds microcode by itself only through
+# GRUB_EARLY_INITRD_LINUX_STOCK, a variable that /usr/bin/grub-mkconfig
+# exports. grub-btrfsd runs /etc/grub.d/41_snapshots-btrfs directly, without
+# grub-mkconfig, so that variable is unset and every entry the daemon
+# regenerates silently loses its `initrd /intel-ucode.img` line while the
+# entries in grub.cfg keep theirs. Naming the image explicitly here fixes both
+# paths, because grub-btrfs sources this config file in both.
+#
+# Only one image is supported on purpose: grub-btrfs expands this array as
+# "${boot_dir}/${GRUB_BTRFS_CUSTOM_MICROCODE[@]}", which prefixes the boot
+# directory onto the first element only, so a second entry would be looked for
+# in the wrong place. One is all a single-vendor host has.
+snapshots_grub_btrfs_microcode: ""
+
+snapshots_grub_btrfs_limit: "20"
+snapshots_grub_btrfs_title_format: '("date" "snapshot" "type" "description")'
+# Empty means grub-btrfs derives the submenu name from /etc/os-release.
+snapshots_grub_btrfs_submenu_name: ""
+
+# A snapper snapshot is read-only, and Arch cannot boot a read-only root: udev,
+# journald and friends need to write. grub-btrfs ships an initcpio hook that
+# spots a read-only btrfs root and stacks a tmpfs overlay on it, so a booted
+# snapshot behaves like a live image and forgets everything on shutdown. The
+# snapshot itself is never modified. Without this, snapshot entries reach the
+# kernel and then fail during early userspace.
+#
+# Because /boot is separate, the single initramfs on the ESP carries this hook
+# for every snapshot entry, including ones taken before the hook existed.
+snapshots_boot_overlayfs_hook: true
+snapshots_mkinitcpio_conf: /etc/mkinitcpio.conf
+snapshots_overlayfs_hook_name: grub-btrfs-overlayfs
+
+# grub-btrfsd rewrites the snapshot submenu when snapshots appear or disappear,
+# so the boot menu does not go stale between Ansible runs. Arch ships it
+# pointing at Timeshift (--timeshift-auto); this role repoints it at the snapper
+# store, which is the change that makes the daemon useful here.
+snapshots_grub_btrfsd_enabled: true
+
+snapshots_grub_dir: /boot/grub
+snapshots_grub_cfg_path: /boot/grub/grub.cfg
+snapshots_grub_btrfs_generator: /etc/grub.d/41_snapshots-btrfs
+snapshots_grub_btrfs_config: /etc/default/grub-btrfs/config
+
+# Shared with roles/boot, which explains why a backup of anything under /boot
+# has to live on the root filesystem: /boot is vfat and rejects both the colons
+# in Ansible's timestamped backup names and an explicit mode.
+snapshots_backup_dir: /var/lib/arch-autodeploy
+
+# --- machi CLI ---------------------------------------------------------------
+machi_enabled: true
+machi_bin_path: /usr/local/bin/machi
+machi_config_path: /etc/machi/machi.conf
+# The free-space warning that runs ahead of snap-pac's pre-transaction hook.
+# Named to sort before 05-snap-pac-pre.hook.
+machi_pacman_hook_path: /etc/pacman.d/hooks/00-machi-snapshot-space.hook
+machi_space_hook_enabled: true

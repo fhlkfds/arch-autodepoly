@@ -1,0 +1,67 @@
+---
+# snapper configuration and the timers that enforce retention.
+
+- name: Install the snapper configuration
+  ansible.builtin.template:
+    src: snapper-config.j2
+    dest: "/etc/snapper/configs/{{ snapshots_config_name }}"
+    owner: root
+    group: root
+    # snapper ships its configs 0640: they name the users allowed to create and
+    # delete snapshots, which is not world-readable information.
+    mode: "0640"
+    backup: true
+  diff: true
+  register: snapshots_snapper_config
+
+# snapper 0.13 itself no longer reads SNAPPER_CONFIGS (systemd-helper walks
+# /etc/snapper/configs and honours each config's own TIMELINE_CREATE and
+# NUMBER_CLEANUP), but snap-pac 3.0.1 still does, and it is the only place it
+# looks: /usr/share/libalpm/scripts/snap-pac iterates exactly the names listed
+# here, so with the shipped SNAPPER_CONFIGS="" no pre-update snapshot is ever
+# created. Set with lineinfile rather than templated, so the rest of the
+# package's file survives a snapper upgrade without a .pacnew.
+- name: Register the snapper configuration for the pacman hooks
+  ansible.builtin.lineinfile:
+    path: /etc/conf.d/snapper
+    regexp: ^#?SNAPPER_CONFIGS=
+    line: SNAPPER_CONFIGS="{{ snapshots_config_name }}"
+    state: present
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+
+- name: Confirm snapper reads the new configuration
+  ansible.builtin.command:
+    argv: [snapper, --config, "{{ snapshots_config_name }}", get-config]
+  register: snapshots_snapper_getconfig
+  changed_when: false
+
+- name: Require the configuration snapper reports to match what was requested
+  ansible.builtin.assert:
+    that:
+      - "'SUBVOLUME' in snapshots_snapper_getconfig.stdout"
+      - snapshots_number_limit in snapshots_snapper_getconfig.stdout
+    fail_msg: >-
+      snapper accepted the configuration file but does not report the expected
+      values back. Inspect `snapper -c {{ snapshots_config_name }} get-config`.
+      Output was: {{ snapshots_snapper_getconfig.stdout }}
+
+# Applies NUMBER_CLEANUP, TIMELINE_CLEANUP and EMPTY_PRE_POST_CLEANUP daily.
+# Without it the retention limits in the config are never enforced, because
+# snap-pac only tags snapshots with a cleanup algorithm; it does not run it.
+- name: Enable the daily snapshot cleanup timer
+  ansible.builtin.systemd_service:
+    name: snapper-cleanup.timer
+    enabled: "{{ snapshots_cleanup_timer_enabled | bool }}"
+    state: "{{ 'started' if snapshots_cleanup_timer_enabled | bool else 'stopped' }}"
+
+# Managed in both directions, because TIMELINE_CREATE in the config and this
+# timer have to agree: the config alone creates nothing, and the timer alone
+# would run hourly for no result.
+- name: Set the hourly timeline snapshot timer to match the configuration
+  ansible.builtin.systemd_service:
+    name: snapper-timeline.timer
+    enabled: "{{ snapshots_timeline_enabled | bool }}"
+    state: "{{ 'started' if snapshots_timeline_enabled | bool else 'stopped' }}"

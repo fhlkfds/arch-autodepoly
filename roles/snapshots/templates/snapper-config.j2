@@ -1,0 +1,68 @@
+# {{ ansible_managed }}
+# Managed by Ansible (roles/snapshots). Do not edit by hand; change the
+# snapshots_* variables and rerun the role instead.
+#
+# Written directly rather than through `snapper create-config`, which would
+# also create its own .snapshots subvolume nested inside {{ snapshots_root_subvol }}.
+# The store this host uses is the top-level {{ snapshots_subvolume_name }} mounted at
+# {{ snapshots_mountpoint }}; see defaults/main.yml for why.
+# Format: snapper-configs(5).
+
+# subvolume to snapshot
+SUBVOLUME="/"
+
+# filesystem type
+FSTYPE="btrfs"
+
+# btrfs qgroup for space aware cleanup algorithms. Empty: qgroups on a
+# filesystem this size cost measurable write performance, and the
+# SPACE_LIMIT/FREE_LIMIT pair below is enforced from filesystem-level free
+# space instead.
+QGROUP=""
+
+# fraction or absolute size of the filesystems space the snapshots may use
+SPACE_LIMIT="{{ snapshots_space_limit }}"
+
+# fraction or absolute size of the filesystems space that should be free
+FREE_LIMIT="{{ snapshots_free_limit }}"
+
+# users and groups allowed to work with config
+ALLOW_USERS="{{ snapshots_allow_users | join(' ') }}"
+ALLOW_GROUPS=""
+
+# sync users and groups from ALLOW_USERS and ALLOW_GROUPS to .snapshots
+# directory
+SYNC_ACL="{{ 'yes' if snapshots_sync_acl | bool else 'no' }}"
+
+# start comparing pre- and post-snapshot in background after creating
+# post-snapshot
+BACKGROUND_COMPARISON="yes"
+
+# run daily number cleanup
+NUMBER_CLEANUP="yes"
+
+# limit for number cleanup
+NUMBER_MIN_AGE="{{ snapshots_number_min_age }}"
+NUMBER_LIMIT="{{ snapshots_number_limit }}"
+NUMBER_LIMIT_IMPORTANT="{{ snapshots_number_limit_important }}"
+
+# create hourly snapshots
+TIMELINE_CREATE="{{ 'yes' if snapshots_timeline_enabled | bool else 'no' }}"
+
+# cleanup hourly snapshots after some time
+TIMELINE_CLEANUP="yes"
+
+# limits for timeline cleanup
+TIMELINE_MIN_AGE="{{ snapshots_number_min_age }}"
+TIMELINE_LIMIT_HOURLY="{{ snapshots_timeline_limits.hourly }}"
+TIMELINE_LIMIT_DAILY="{{ snapshots_timeline_limits.daily }}"
+TIMELINE_LIMIT_WEEKLY="{{ snapshots_timeline_limits.weekly }}"
+TIMELINE_LIMIT_MONTHLY="{{ snapshots_timeline_limits.monthly }}"
+TIMELINE_LIMIT_QUARTERLY="{{ snapshots_timeline_limits.quarterly }}"
+TIMELINE_LIMIT_YEARLY="{{ snapshots_timeline_limits.yearly }}"
+
+# cleanup empty pre-post-pairs
+EMPTY_PRE_POST_CLEANUP="yes"
+
+# limits for empty pre-post-pair cleanup
+EMPTY_PRE_POST_MIN_AGE="{{ snapshots_number_min_age }}"

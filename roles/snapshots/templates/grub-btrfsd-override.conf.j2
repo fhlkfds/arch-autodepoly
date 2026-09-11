@@ -1,0 +1,17 @@
+# {{ ansible_managed }}
+# Managed by Ansible (roles/snapshots). Do not edit by hand.
+#
+# Arch ships grub-btrfsd.service with
+#   ExecStart=/usr/bin/grub-btrfsd --syslog /.snapshots
+# but the packaged drop-in on a host that has ever had Timeshift installed
+# points it at --timeshift-auto instead, where it sits watching /run/timeshift
+# forever and never notices a snapper snapshot. Repointed here at the snapper
+# store, which is what makes the GRUB snapshot submenu refresh by itself
+# between Ansible runs.
+#
+# The empty ExecStart= is required: systemd appends to ExecStart for Type=simple
+# units unless the list is cleared first.
+
+[Service]
+ExecStart=
+ExecStart=/usr/bin/grub-btrfsd --syslog {{ snapshots_mountpoint }}

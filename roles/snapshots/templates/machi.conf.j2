@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+# Managed by Ansible (roles/snapshots). Do not edit by hand; change the
+# snapshots_*/machi_* variables and rerun the role.
+#
+# Read by {{ machi_bin_path }}. Everything host-specific the CLI needs lives
+# here rather than in the script, so the script stays identical on every host
+# and the policy stays in Ansible.
+
+snapper_config={{ snapshots_config_name }}
+snapshot_mountpoint={{ snapshots_mountpoint }}
+root_subvolume={{ snapshots_root_subvol }}
+min_free_gib={{ snapshots_min_free_gib }}
+boot_integration={{ 'true' if (snapshots_boot_integration | bool and snapshots_grub_present | bool) else 'false' }}
+grub_btrfs_generator={{ snapshots_grub_btrfs_generator }}
+grub_btrfsd_unit=grub-btrfsd.service

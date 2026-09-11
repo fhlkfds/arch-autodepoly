@@ -1,0 +1,163 @@
+---
+# Creates the top-level @snapshots subvolume and mounts it at /.snapshots.
+# Rationale for a top-level store rather than a nested @/.snapshots is in
+# defaults/main.yml.
+
+- name: Install the snapshot and boot-integration packages
+  community.general.pacman:
+    name: "{{ snapshots_packages }}"
+    state: present
+
+# A plain directory here would end up inside every snapshot of @, and a nested
+# subvolume would be destroyed by the rollback procedure. Either is recoverable
+# by hand but neither is something to do silently, so refuse and explain.
+- name: Inspect anything already at the snapshot mount point
+  ansible.builtin.stat:
+    path: "{{ snapshots_mountpoint }}"
+  register: snapshots_mountpoint_stat
+
+- name: Check whether the snapshot mount point is already a mount
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --output, SOURCE, --mountpoint, "{{ snapshots_mountpoint }}"]
+  register: snapshots_mountpoint_findmnt
+  changed_when: false
+  failed_when: false
+
+- name: Check whether the snapshot mount point is an unmounted subvolume
+  ansible.builtin.command:
+    argv: [btrfs, subvolume, show, "{{ snapshots_mountpoint }}"]
+  register: snapshots_mountpoint_subvol
+  changed_when: false
+  failed_when: false
+  when:
+    - snapshots_mountpoint_stat.stat.exists
+    - snapshots_mountpoint_findmnt.rc != 0
+
+- name: Refuse to displace an existing nested snapshot subvolume
+  ansible.builtin.assert:
+    that:
+      - snapshots_mountpoint_subvol.rc | default(1) != 0
+    fail_msg: >-
+      {{ snapshots_mountpoint }} is already a btrfs subvolume nested inside
+      {{ snapshots_root_subvol }} (most likely created by
+      `snapper create-config`). This role wants a top-level
+      {{ snapshots_subvolume_name }} mounted there instead, and will not delete
+      a subvolume that may hold snapshots. Nothing has been changed.
+      Move the existing snapshots aside and remove the nested subvolume:
+        snapper -c {{ snapshots_config_name }} list
+        btrfs subvolume delete {{ snapshots_mountpoint }}
+      then rerun this role. See docs/snapshots.md.
+  when:
+    - snapshots_mountpoint_stat.stat.exists
+    - snapshots_mountpoint_findmnt.rc != 0
+    - snapshots_mountpoint_subvol is not skipped
+
+# The store has to be created from the filesystem root (subvolid=5), which is
+# not mounted anywhere during normal operation. Mounted under /run so nothing
+# survives a reboot even if a later task fails before the unmount.
+- name: Create the snapshot store subvolume
+  when: not (snapshots_store_exists | bool)
+  block:
+    - name: Create a temporary mount point for the filesystem root
+      ansible.builtin.file:
+        path: /run/arch-autodeploy-btrfs-root
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Mount the btrfs filesystem root
+      ansible.posix.mount:
+        path: /run/arch-autodeploy-btrfs-root
+        src: "{{ snapshots_root_device }}"
+        fstype: btrfs
+        opts: subvolid=5
+        # Explicitly not "mounted": this must never reach /etc/fstab.
+        state: ephemeral
+
+    - name: Create the top-level snapshot subvolume
+      ansible.builtin.command:
+        argv:
+          - btrfs
+          - subvolume
+          - create
+          - "/run/arch-autodeploy-btrfs-root/{{ snapshots_subvolume_name }}"
+      register: snapshots_store_create
+      changed_when: true
+  always:
+    - name: Unmount the btrfs filesystem root
+      ansible.posix.mount:
+        path: /run/arch-autodeploy-btrfs-root
+        state: unmounted
+
+    - name: Remove the temporary mount point
+      ansible.builtin.file:
+        path: /run/arch-autodeploy-btrfs-root
+        state: absent
+
+# Additive: the mount module appends a line for a path that has none and
+# rewrites nothing else. The existing @, @home, @log and @pkg lines are left
+# exactly as they are, and the file is backed up first.
+- name: Mount the snapshot store
+  when: snapshots_manage_fstab | bool
+  block:
+    - name: Ensure the backup directory exists
+      ansible.builtin.file:
+        path: "{{ snapshots_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Check whether /etc/fstab has already been backed up
+      ansible.builtin.stat:
+        path: "{{ snapshots_backup_dir }}/fstab.before-snapshots"
+      register: snapshots_fstab_backup_stat
+
+    - name: Back up /etc/fstab before adding the snapshot mount
+      ansible.builtin.copy:
+        src: /etc/fstab
+        dest: "{{ snapshots_backup_dir }}/fstab.before-snapshots"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      when: not snapshots_fstab_backup_stat.stat.exists
+
+    # Options are derived from the live root mount so compression, cache and
+    # SSD settings match the rest of the filesystem without being restated
+    # here. subvolid is dropped (it is an allocated id, not a stable name) and
+    # subvol is repointed at the store.
+    - name: Add the snapshot store to /etc/fstab and mount it
+      vars:
+        snapshots_store_opts: >-
+          {{ (snapshots_root_options.split(',')
+              | reject('match', '^subvolid=')
+              | reject('match', '^subvol=')
+              | list
+              + ['subvol=/' ~ snapshots_subvolume_name]) | join(',') }}
+      ansible.posix.mount:
+        path: "{{ snapshots_mountpoint }}"
+        src: "UUID={{ snapshots_root_uuid }}"
+        fstype: btrfs
+        opts: "{{ snapshots_store_opts }}"
+        state: mounted
+      register: snapshots_store_mount
+
+- name: Require the snapshot store to be mounted
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --output, "SOURCE,OPTIONS", --mountpoint, "{{ snapshots_mountpoint }}"]
+  register: snapshots_store_verify
+  changed_when: false
+  failed_when: snapshots_store_verify.rc != 0 or snapshots_subvolume_name not in snapshots_store_verify.stdout
+
+# snapper's own permissions on the store: root-owned, not world-readable,
+# because snapshots contain every file in /etc including private keys.
+# SYNC_ACL in the snapper config grants the allowed users read access on top.
+- name: Restrict permissions on the snapshot store
+  ansible.builtin.file:
+    path: "{{ snapshots_mountpoint }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"

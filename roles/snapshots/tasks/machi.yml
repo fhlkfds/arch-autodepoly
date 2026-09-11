@@ -1,0 +1,61 @@
+---
+# The machi CLI. No such command existed in the repository or on the host
+# before this role (the README's only "machi" matches were inside the word
+# "machine"), so this is the first subcommand group rather than an extension.
+#
+# Python, stdlib only: it matches the repository's other non-trivial helpers
+# (scripts/make-password-hash.py, roles/dotfiles/files/stow_manifest.py), and
+# site.yml already guarantees a Python interpreter on the host before any role
+# runs.
+#
+# Installed to /usr/local/bin so pacman never owns or overwrites it, and so it
+# is on root's PATH for the pacman hook as well as on the user's.
+
+- name: Ensure the machi configuration directory exists
+  ansible.builtin.file:
+    path: "{{ machi_config_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: machi_enabled | bool
+
+- name: Install the machi configuration
+  ansible.builtin.template:
+    src: machi.conf.j2
+    dest: "{{ machi_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  diff: true
+  when: machi_enabled | bool
+
+# validate runs the candidate through Python's compiler before it is put in
+# place, so a broken template cannot leave a non-working machi on the host.
+- name: Install the machi CLI
+  ansible.builtin.template:
+    src: machi.j2
+    dest: "{{ machi_bin_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+    validate: "{{ ansible_facts.python.executable | default('/usr/bin/python3') }} -m py_compile %s"
+    backup: true
+  diff: true
+  when: machi_enabled | bool
+
+- name: Remove the machi CLI
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ machi_bin_path }}"
+    - "{{ machi_config_path }}"
+  when: not (machi_enabled | bool)
+
+- name: Prove that the machi CLI runs
+  ansible.builtin.command:
+    argv: ["{{ machi_bin_path }}", snapshot, space-check]
+  register: snapshots_machi_check
+  changed_when: false
+  when: machi_enabled | bool

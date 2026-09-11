@@ -61,6 +61,20 @@
     # the unified kernel image is rebuilt with the quiet cmdline.
     - role: boot
       tags: [boot]
+    # After boot, which owns /etc/default/grub and the shared grub.cfg
+    # regeneration, so the snapshot submenu is added to a GRUB configuration
+    # that already carries the quiet cmdline and the theme rather than racing
+    # it. After packages for the same reason boot is: the kernel and
+    # mkinitcpio presets have to be settled before the initramfs is rebuilt
+    # with the overlayfs hook.
+    #
+    # Only `snapshots` here. A role-level tag is added to every task in the
+    # role, so listing btrfs, boot and machi here too would override the
+    # narrower tags the role's own task files carry and make
+    # `--tags machi` run the whole role. Those tags still select: every task
+    # keeps its own alongside this one.
+    - role: snapshots
+      tags: [snapshots]
     - role: docker
       tags: [docker]
     - role: dotfiles

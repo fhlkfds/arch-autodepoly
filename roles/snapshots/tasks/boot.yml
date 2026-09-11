@@ -1,0 +1,425 @@
+---
+# Bootable snapshots. grub-btrfs is the only integration implemented here, and
+# it is only used when GRUB is actually the bootloader; nothing is assumed.
+
+- name: Explain why the boot menu is not being touched
+  vars:
+    snapshots_no_grub_reason: >-
+      No GRUB found ({{ snapshots_grub_cfg_path }} or /usr/bin/grub-mkconfig is
+      missing){{ ', and systemd-boot is installed on the EFI system partition'
+                 if snapshots_systemd_boot_present else '' }}. grub-btrfs is the
+      only snapshot boot integration this role implements, so nothing was
+      changed. Snapshots still work; to boot one you would have to add an entry
+      by hand, or install GRUB and rerun with snapshots_boot_integration=true.
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'snapshots_boot_integration is false, so GRUB was left alone.
+          Snapshots are still created; they are just not offered at boot.'
+         if not (snapshots_boot_integration | bool)
+         else snapshots_no_grub_reason }}
+  when: not (snapshots_boot_integration | bool and snapshots_grub_present | bool)
+
+- name: Integrate snapshots into the GRUB menu
+  when:
+    - snapshots_boot_integration | bool
+    - snapshots_grub_present | bool
+  block:
+    # A UKI carries its own cmdline, so a GRUB entry cannot override
+    # rootflags=subvol= for it. Entries would be generated and would simply not
+    # be what the firmware loads. Warn rather than fail: GRUB is still present
+    # and the entries are still correct for the non-UKI kernels.
+    - name: Warn when unified kernel images bypass the GRUB menu
+      ansible.builtin.debug:
+        msg: >-
+          Unified kernel images were found in /boot/EFI/Linux. A UKI bakes its
+          kernel cmdline in at build time, so a GRUB snapshot entry cannot
+          redirect it to a snapshot subvolume. Snapshot entries will be
+          generated for the kernel and initramfs in /boot, but if the firmware
+          boots a UKI directly, selecting them requires booting GRUB first.
+      when: snapshots_uki_present | bool
+
+    # --- grub-btrfs configuration -------------------------------------------
+    # lineinfile rather than a template: /etc/default/grub-btrfs/config is a
+    # package file with a hundred documented options, and rewriting it would
+    # turn every grub-btrfs upgrade into a .pacnew to reconcile. Only the keys
+    # this role has an opinion about are set, and each regexp also matches the
+    # commented-out shipped default. The same approach roles/boot takes with
+    # /etc/default/grub.
+    - name: Configure grub-btrfs
+      ansible.builtin.lineinfile:
+        path: "{{ snapshots_grub_btrfs_config }}"
+        regexp: "^#?{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        state: present
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      loop:
+        # How many snapshots reach the menu. Above this the oldest are dropped
+        # from the menu only; nothing is deleted.
+        - key: GRUB_BTRFS_LIMIT
+          value: '"{{ snapshots_grub_btrfs_limit }}"'
+        # Which columns each entry shows. "type" is what distinguishes a pre
+        # from a post snapshot at boot, and "description" carries the pacman
+        # command line that snap-pac recorded.
+        - key: GRUB_BTRFS_TITLE_FORMAT
+          value: "{{ snapshots_grub_btrfs_title_format }}"
+        # Printed by grub-mkconfig, so a run states which snapshots it found
+        # instead of silently producing an empty submenu.
+        - key: GRUB_BTRFS_SHOW_SNAPSHOTS_FOUND
+          value: '"true"'
+        - key: GRUB_BTRFS_SHOW_TOTAL_SNAPSHOTS_FOUND
+          value: '"true"'
+      loop_control:
+        label: "{{ item.key }}"
+      register: snapshots_grub_btrfs_keys
+
+    - name: Set the GRUB snapshot submenu name
+      ansible.builtin.lineinfile:
+        path: "{{ snapshots_grub_btrfs_config }}"
+        regexp: ^#?GRUB_BTRFS_SUBMENUNAME=
+        line: GRUB_BTRFS_SUBMENUNAME="{{ snapshots_grub_btrfs_submenu_name }}"
+        state: present
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      when: snapshots_grub_btrfs_submenu_name | length > 0
+      register: snapshots_grub_btrfs_name
+
+    # See snapshots_grub_btrfs_microcode in defaults for why this is set
+    # explicitly rather than left to grub-btrfs's own detection.
+    - name: Find the CPU microcode images on the boot filesystem
+      ansible.builtin.find:
+        paths: /boot
+        patterns: ["intel-ucode.img", "amd-ucode.img", "intel-uc.img", "amd-uc.img", "early_ucode.cpio", "microcode.cpio"]
+        file_type: file
+        recurse: false
+      register: snapshots_microcode_find
+      when: snapshots_grub_btrfs_microcode | length == 0
+
+    - name: Record the microcode image the snapshot entries should load
+      ansible.builtin.set_fact:
+        snapshots_microcode_image: >-
+          {{ snapshots_grub_btrfs_microcode
+             if snapshots_grub_btrfs_microcode | length > 0
+             else ((snapshots_microcode_find.files | default([]))
+                   | map(attribute='path') | map('basename') | sort | first | default('')) }}
+
+    - name: Set the microcode image for the snapshot boot entries
+      ansible.builtin.lineinfile:
+        path: "{{ snapshots_grub_btrfs_config }}"
+        regexp: ^#?GRUB_BTRFS_CUSTOM_MICROCODE=
+        line: GRUB_BTRFS_CUSTOM_MICROCODE=("{{ snapshots_microcode_image }}")
+        state: present
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      when: snapshots_microcode_image | length > 0
+      register: snapshots_grub_btrfs_ucode
+
+    - name: Report that no CPU microcode image was found
+      ansible.builtin.debug:
+        msg: >-
+          No CPU microcode image was found in /boot, so snapshot boot entries
+          will load none. That matches the ordinary boot entries on a host with
+          no microcode package installed; if intel-ucode or amd-ucode is
+          expected here, install it and rerun.
+      when: snapshots_microcode_image | length == 0
+
+    # --- The overlayfs initcpio hook ----------------------------------------
+    # Without this, every snapshot entry in the menu reaches the kernel and
+    # then fails in early userspace, because snapper's snapshots are read-only
+    # and Arch cannot boot a read-only root. See the note in defaults.
+    - name: Make read-only snapshots bootable
+      when: snapshots_boot_overlayfs_hook | bool
+      block:
+        - name: Require the overlayfs initcpio hook to be installed
+          ansible.builtin.stat:
+            path: "/usr/lib/initcpio/hooks/{{ snapshots_overlayfs_hook_name }}"
+          register: snapshots_overlayfs_hook_stat
+
+        - name: Fail when the overlayfs initcpio hook is missing
+          ansible.builtin.assert:
+            that:
+              - snapshots_overlayfs_hook_stat.stat.exists
+            fail_msg: >-
+              /usr/lib/initcpio/hooks/{{ snapshots_overlayfs_hook_name }} is
+              missing, so a read-only snapshot could not be booted even with
+              menu entries present. It ships with grub-btrfs; check that the
+              package installed cleanly, or set
+              snapshots_boot_overlayfs_hook=false to accept snapshot entries
+              that will not complete boot.
+
+        - name: Read the current mkinitcpio HOOKS
+          ansible.builtin.slurp:
+            src: "{{ snapshots_mkinitcpio_conf }}"
+          register: snapshots_mkinitcpio_current
+
+        - name: Record the current and wanted HOOKS lists
+          vars:
+            snapshots_hooks_now: >-
+              {{ (snapshots_mkinitcpio_current.content | b64decode
+                  | regex_search('^HOOKS=\((.*)\)\s*$', '\1', multiline=True)
+                  | first | default('')).split() }}
+          ansible.builtin.set_fact:
+            snapshots_hooks_current: "{{ snapshots_hooks_now }}"
+            # Appended, never reordered: the existing order encrypts and
+            # assembles the root device correctly and is not this role's to
+            # rearrange. The hook is a run_latehook, so it runs after the root
+            # filesystem is mounted regardless of position, and upstream
+            # documents adding it at the end.
+            snapshots_hooks_wanted: >-
+              {{ snapshots_hooks_now
+                 if snapshots_overlayfs_hook_name in snapshots_hooks_now
+                 else snapshots_hooks_now + [snapshots_overlayfs_hook_name] }}
+
+        - name: Require a HOOKS line to have been found
+          ansible.builtin.assert:
+            that:
+              - snapshots_hooks_current | length > 0
+            fail_msg: >-
+              No HOOKS=(...) line was found in {{ snapshots_mkinitcpio_conf }},
+              so the overlayfs hook cannot be added without guessing at the
+              file's structure. Nothing has been changed. Add
+              {{ snapshots_overlayfs_hook_name }} to HOOKS by hand and rerun,
+              or set snapshots_boot_overlayfs_hook=false.
+
+        - name: Add the overlayfs hook to the initramfs
+          ansible.builtin.lineinfile:
+            path: "{{ snapshots_mkinitcpio_conf }}"
+            regexp: ^HOOKS=\(
+            line: "HOOKS=({{ snapshots_hooks_wanted | join(' ') }})"
+            state: present
+            owner: root
+            group: root
+            mode: "0644"
+            backup: true
+          diff: true
+          notify: rebuild initramfs
+
+    # --- The regeneration daemon --------------------------------------------
+    - name: Ensure the systemd drop-in directories exist
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ item }}.d"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - grub-btrfsd.service
+        - snapper-cleanup.service
+
+    - name: Point the snapshot boot-menu daemon at the snapper store
+      ansible.builtin.template:
+        src: grub-btrfsd-override.conf.j2
+        dest: /etc/systemd/system/grub-btrfsd.service.d/override.conf
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      diff: true
+      register: snapshots_grub_btrfsd_override
+
+    - name: Set the snapshot boot-menu daemon to the configured state
+      ansible.builtin.systemd_service:
+        name: grub-btrfsd.service
+        enabled: "{{ snapshots_grub_btrfsd_enabled | bool }}"
+        state: "{{ 'restarted' if (snapshots_grub_btrfsd_override.changed and snapshots_grub_btrfsd_enabled | bool) else ('started' if snapshots_grub_btrfsd_enabled | bool else 'stopped') }}"
+        daemon_reload: true
+
+    # See the template for the race this closes.
+    - name: Regenerate the snapshot boot menu after the daily cleanup
+      ansible.builtin.template:
+        src: snapper-cleanup-override.conf.j2
+        dest: /etc/systemd/system/snapper-cleanup.service.d/override.conf
+        owner: root
+        group: root
+        mode: "0644"
+      diff: true
+      register: snapshots_cleanup_override
+
+    - name: Reload systemd after changing the cleanup unit
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: snapshots_cleanup_override.changed
+
+    # --- grub.cfg ------------------------------------------------------------
+    # Rebuilt only when something above changed, and never in place: generated
+    # to a candidate path, syntax-checked, compared against the entries that
+    # exist today, and only then installed. The same pattern and the same
+    # reasons as roles/boot, including why a backup of a file on the vfat EFI
+    # system partition has to be written to the root filesystem.
+    # Probed before the regeneration below, because a host where grub.cfg has
+    # never been rebuilt since grub-btrfs was installed has no wrapper to
+    # source the snapshot submenu, and that is a reason to regenerate even
+    # when no configuration key changed on this run.
+    - name: Check whether grub.cfg already sources the snapshot submenu
+      ansible.builtin.command:
+        argv: [grep, -q, "grub-btrfs.cfg", "{{ snapshots_grub_cfg_path }}"]
+      register: snapshots_grub_cfg_wrapper_before
+      changed_when: false
+      failed_when: false
+
+    - name: Record the boot entries that exist before any regeneration
+      ansible.builtin.command:
+        argv: [grep, -c, "^\\s*menuentry ", "{{ snapshots_grub_cfg_path }}"]
+      register: snapshots_menuentries_before
+      changed_when: false
+      failed_when: false
+
+    - name: Regenerate grub.cfg with the snapshot submenu
+      when: >-
+        (snapshots_grub_btrfs_keys.changed | default(false))
+        or (snapshots_grub_btrfs_name.changed | default(false))
+        or (snapshots_grub_btrfs_ucode.changed | default(false))
+        or (snapshots_grub_cfg_wrapper_before.rc | default(1)) != 0
+      block:
+        - name: Ensure the boot backup directory exists
+          ansible.builtin.file:
+            path: "{{ snapshots_backup_dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
+        - name: Back up the current grub.cfg outside /boot
+          ansible.builtin.copy:
+            src: "{{ snapshots_grub_cfg_path }}"
+            dest: "{{ snapshots_backup_dir }}/grub.cfg.before-snapshots"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0600"
+            force: false
+          when: snapshots_grub_cfg_stat.stat.exists
+
+        - name: Generate a candidate grub.cfg
+          ansible.builtin.command:
+            argv: [grub-mkconfig, -o, "{{ snapshots_grub_cfg_path }}.machi-new"]
+          register: snapshots_grub_mkconfig
+          changed_when: true
+
+        - name: Syntax-check the candidate grub.cfg
+          ansible.builtin.command:
+            argv: [grub-script-check, "{{ snapshots_grub_cfg_path }}.machi-new"]
+          changed_when: false
+
+        - name: Count the boot entries in the candidate grub.cfg
+          ansible.builtin.command:
+            argv: [grep, -c, "^\\s*menuentry ", "{{ snapshots_grub_cfg_path }}.machi-new"]
+          register: snapshots_menuentries_after
+          changed_when: false
+          failed_when: false
+
+        # The candidate is discarded rather than installed if it has fewer
+        # entries than the live file, which is the failure that would leave the
+        # host with no way to boot the system it is running.
+        - name: Refuse a candidate grub.cfg that lost boot entries
+          ansible.builtin.assert:
+            that:
+              - (snapshots_menuentries_after.stdout | int) >= (snapshots_menuentries_before.stdout | int)
+            fail_msg: >-
+              The regenerated grub.cfg has
+              {{ snapshots_menuentries_after.stdout | int }} menu entries but
+              the live one has {{ snapshots_menuentries_before.stdout | int }}.
+              Refusing to install it. The live grub.cfg is untouched and the
+              candidate is removed; inspect
+              {{ snapshots_grub_cfg_path }}.machi-new before it is deleted by
+              rerunning with -vv, and check /etc/grub.d for a generator that
+              is failing.
+
+        # No owner, group, mode or backup: /boot is vfat, which cannot
+        # represent them and fails rather than ignores the request. With
+        # remote_src the copy module replaces an existing file by writing a
+        # temporary file in the destination directory and renaming it, with no
+        # chown or chmod, which is all vfat accepts.
+        - name: Install the validated grub.cfg  # noqa: risky-file-permissions
+          ansible.builtin.copy:
+            src: "{{ snapshots_grub_cfg_path }}.machi-new"
+            dest: "{{ snapshots_grub_cfg_path }}"
+            remote_src: true
+      always:
+        - name: Remove the candidate grub.cfg
+          ansible.builtin.file:
+            path: "{{ snapshots_grub_cfg_path }}.machi-new"
+            state: absent
+
+    # grub.cfg only holds a wrapper that sources ${prefix}/grub-btrfs.cfg; the
+    # snapshot entries themselves live in that second file, which the generator
+    # writes. Run every time so the menu matches the snapshots that exist right
+    # now even on a run where nothing else changed. changed_when is false
+    # because it is a regeneration of a derived file, not a configuration
+    # change, and grub-btrfsd rewrites it on its own anyway.
+    - name: Generate the snapshot boot entries
+      ansible.builtin.command:
+        argv: ["{{ snapshots_grub_btrfs_generator }}"]
+      register: snapshots_grub_btrfs_run
+      changed_when: false
+
+    - name: Confirm grub.cfg sources the snapshot submenu
+      ansible.builtin.command:
+        argv: [grep, -q, "grub-btrfs.cfg", "{{ snapshots_grub_cfg_path }}"]
+      register: snapshots_grub_cfg_wrapper
+      changed_when: false
+      failed_when: false
+
+    - name: Require grub.cfg to source the snapshot submenu
+      ansible.builtin.assert:
+        that:
+          - snapshots_grub_cfg_wrapper.rc == 0
+        fail_msg: >-
+          {{ snapshots_grub_cfg_path }} does not source grub-btrfs.cfg, so no
+          snapshot would be offered at boot even though the snapshots exist.
+          /etc/grub.d/41_snapshots-btrfs writes that wrapper, so either it is
+          not executable or grub.cfg has not been regenerated since grub-btrfs
+          was installed. Fix with:
+            sudo grub-mkconfig -o {{ snapshots_grub_cfg_path }}
+
+    # The submenu is only worth anything if its entries actually name a kernel
+    # and an initramfs. Checked here rather than trusted, because the generator
+    # silently writes an empty submenu when it cannot find them.
+    - name: Read the generated snapshot boot entries
+      ansible.builtin.slurp:
+        src: "{{ snapshots_grub_dir }}/grub-btrfs.cfg"
+      register: snapshots_grub_btrfs_cfg
+      failed_when: false
+
+    - name: Syntax-check the generated snapshot boot entries
+      ansible.builtin.command:
+        argv: [grub-script-check, "{{ snapshots_grub_dir }}/grub-btrfs.cfg"]
+      changed_when: false
+      when: snapshots_grub_btrfs_cfg.content is defined
+
+    # Only meaningful once a snapshot exists. Before the first one the
+    # generator writes no file at all, and grub.cfg's wrapper sources it only
+    # if it is there, so an empty store is not a failure.
+    - name: Require the snapshot boot entries to load a kernel and an initramfs
+      vars:
+        snapshots_btrfs_cfg_text: "{{ snapshots_grub_btrfs_cfg.content | b64decode }}"
+      ansible.builtin.assert:
+        that:
+          - "'linux \"/' in snapshots_btrfs_cfg_text"
+          - "'initrd \"/' in snapshots_btrfs_cfg_text"
+          - snapshots_microcode_image | length == 0 or snapshots_microcode_image in snapshots_btrfs_cfg_text
+        fail_msg: >-
+          {{ snapshots_grub_dir }}/grub-btrfs.cfg exists but its entries do not
+          load a kernel, an initramfs and the {{ snapshots_microcode_image }}
+          microcode. A snapshot selected at boot would fail. Regenerate with
+          `sudo {{ snapshots_grub_btrfs_generator }}` and check that /boot holds
+          vmlinuz-linux and initramfs-linux.img.
+        success_msg: >-
+          Snapshot boot entries load the kernel, initramfs{{
+            ' and ' ~ snapshots_microcode_image if snapshots_microcode_image | length > 0 else '' }}
+          from the boot filesystem.
+      when:
+        - snapshots_grub_btrfs_cfg.content is defined
+        - "'menuentry' in (snapshots_grub_btrfs_cfg.content | b64decode)"
+
+    # Flushed inside the role so the report below describes an initramfs that
+    # has actually been rebuilt, rather than one still queued for the end of
+    # the play.
+    - name: Rebuild the initramfs now if it was changed
+      ansible.builtin.meta: flush_handlers

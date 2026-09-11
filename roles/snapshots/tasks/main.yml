@@ -1,0 +1,48 @@
+---
+# Entry point. Split by concern so a run can be narrowed with --tags:
+#   btrfs      filesystem detection and the @snapshots store
+#   snapshots  snapper configuration, cleanup timer, pacman hooks
+#   boot       grub-btrfs, the overlayfs initcpio hook, grub.cfg
+#   machi      the machi CLI
+# The preflight checks are tagged with all of them, because every later file
+# depends on the facts they set.
+
+- name: Skip the snapshot system entirely
+  ansible.builtin.debug:
+    msg: >-
+      snapshots_enabled is false, so no snapshot, hook or bootloader files were
+      touched. Already-deployed files are left in place; see the uninstall
+      section of docs/snapshots.md to remove them.
+  when: not (snapshots_enabled | bool)
+  tags: [btrfs, snapshots, boot, machi]
+
+- name: Configure the bootable snapshot system
+  when: snapshots_enabled | bool
+  block:
+    - name: Detect the filesystem layout
+      ansible.builtin.import_tasks: preflight.yml
+      tags: [btrfs, snapshots, boot, machi]
+
+    - name: Provide the snapshot store
+      ansible.builtin.import_tasks: store.yml
+      tags: [btrfs, snapshots]
+
+    - name: Configure snapper
+      ansible.builtin.import_tasks: snapper.yml
+      tags: [snapshots]
+
+    - name: Configure the automatic pre-update snapshots
+      ansible.builtin.import_tasks: hooks.yml
+      tags: [snapshots]
+
+    - name: Install the machi CLI
+      ansible.builtin.import_tasks: machi.yml
+      tags: [machi]
+
+    - name: Integrate snapshots into the boot menu
+      ansible.builtin.import_tasks: boot.yml
+      tags: [boot]
+
+    - name: Report the resulting snapshot system
+      ansible.builtin.import_tasks: report.yml
+      tags: [btrfs, snapshots, boot, machi]

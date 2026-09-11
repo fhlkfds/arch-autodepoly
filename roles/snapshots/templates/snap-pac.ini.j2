@@ -1,0 +1,32 @@
+; {{ ansible_managed }}
+; Managed by Ansible (roles/snapshots). Do not edit by hand; change the
+; snapshots_* variables and rerun the role instead.
+;
+; snap-pac ships this path as a package file, so a future snap-pac upgrade
+; leaves its version as /etc/snap-pac.ini.pacnew rather than overwriting this.
+; Compare the two after such an upgrade if new options appear.
+; Format: snap-pac(8).
+
+[{{ snapshots_config_name }}]
+; Whether a pacman transaction snapshots this snapper configuration. This is
+; the switch snapshots_auto_pre_update maps onto: with it false the hooks still
+; run but create nothing, which is cleaner and more reversible than deleting
+; the hooks pacman owns.
+snapshot = {{ 'True' if snapshots_auto_pre_update | bool else 'False' }}
+
+; snap-pac tags its snapshots with this algorithm; snapper-cleanup.timer is
+; what later applies it under the NUMBER_* limits in the snapper config.
+cleanup_algorithm = number
+
+desc_limit = {{ snapshots_description_limit }}
+{% if snapshots_pre_description | length > 0 %}
+pre_description = {{ snapshots_pre_description }}
+{% endif %}
+{% if snapshots_post_description | length > 0 %}
+post_description = {{ snapshots_post_description }}
+{% endif %}
+
+; Snapshots touching these packages get userdata important=yes and are retained
+; under NUMBER_LIMIT_IMPORTANT instead of NUMBER_LIMIT.
+important_packages = {{ snapshots_important_packages | to_json }}
+important_commands = {{ snapshots_important_commands | to_json }}

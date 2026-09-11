@@ -1,0 +1,61 @@
+---
+# What the run actually produced, read back from the system rather than from
+# the variables that were meant to configure it.
+
+- name: Read the snapshots that now exist
+  ansible.builtin.command:
+    argv: [snapper, --config, "{{ snapshots_config_name }}", --machine-readable, csv, list]
+  register: snapshots_final_list
+  changed_when: false
+  failed_when: false
+
+- name: Read the generated snapshot boot entries
+  ansible.builtin.command:
+    # --class snapshots, not menuentry: grub-btrfs's first line is a fake
+    # menuentry drawing the column header, which is not a bootable entry.
+    # -e, because the pattern starts with a dash and grep would otherwise read
+    # it as options.
+    argv: [grep, -c, -e, "--class snapshots", "{{ snapshots_grub_dir }}/grub-btrfs.cfg"]
+  register: snapshots_boot_entries
+  changed_when: false
+  failed_when: false
+
+- name: Read the free space on the root filesystem
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --bytes, --output, AVAIL, --mountpoint, /]
+  register: snapshots_free_bytes
+  changed_when: false
+
+- name: Report the snapshot system
+  vars:
+    # Minus the CSV header, and minus snapshot 0, which is snapper's pseudo
+    # entry for the running system rather than a snapshot that exists on disk.
+    snapshots_count: >-
+      {{ snapshots_final_list.stdout_lines | default([]) | reject('match', '^config,')
+         | map('regex_search', '^[^,]*,[^,]*,(\d+),', '\1') | select() | map('first')
+         | reject('eq', '0') | list | length }}
+    snapshots_free_gib: >-
+      {{ ((snapshots_free_bytes.stdout | trim | int) / 1024 / 1024 / 1024) | round(1) }}
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['Engine: snapper config "' ~ snapshots_config_name ~ '" on subvolume '
+          ~ snapshots_root_subvol ~ ', store ' ~ snapshots_subvolume_name
+          ~ ' mounted at ' ~ snapshots_mountpoint ~ '.']
+         + ['Snapshots present: ' ~ snapshots_count ~ '. Free space: '
+            ~ snapshots_free_gib ~ ' GiB (floor ' ~ snapshots_min_free_gib ~ ' GiB).']
+         + ['Retention: ' ~ snapshots_number_limit ~ ' numbered, '
+            ~ snapshots_number_limit_important ~ ' important, enforced '
+            ~ ('daily by snapper-cleanup.timer.' if snapshots_cleanup_timer_enabled | bool
+               else 'by nothing - snapshots_cleanup_timer_enabled is false.')]
+         + [('Pre-update snapshots: enabled through snap-pac, on every pacman or AUR-helper transaction that installs, upgrades or removes a package.'
+             if snapshots_auto_pre_update | bool
+             else 'Pre-update snapshots: disabled (snapshots_auto_pre_update=false).')]
+         + [('Boot menu: ' ~ (snapshots_boot_entries.stdout | default('0') | trim | default('0', true))
+             ~ ' snapshot entries in ' ~ snapshots_grub_dir ~ '/grub-btrfs.cfg, offered under the snapshot submenu of the GRUB menu.')
+            if (snapshots_boot_integration | bool and snapshots_grub_present | bool)
+            else 'Boot menu: not integrated.']
+         + [('Paths excluded from snapshots (separate subvolumes or other filesystems): '
+             ~ (snapshots_excluded_paths | join(' ')))]
+         + [('Manual command: machi snapshot create|list|cleanup.' if machi_enabled | bool
+             else 'machi CLI: not installed (machi_enabled=false).')]
+         + ['Booting a snapshot and rolling one back permanently are documented in docs/snapshots.md.'] }}

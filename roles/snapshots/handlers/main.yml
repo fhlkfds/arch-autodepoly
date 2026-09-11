@@ -1,0 +1,11 @@
+---
+# The cmdline and module list baked into the initramfs only change when the
+# image is rebuilt, so every task that edits /etc/mkinitcpio.conf notifies
+# this. If it fails, the previous initramfs is still on the EFI system
+# partition and the host still boots exactly as it does now, just without the
+# overlayfs hook that makes read-only snapshots bootable.
+- name: Rebuild the initramfs
+  ansible.builtin.command:
+    argv: [mkinitcpio, -P]
+  changed_when: true
+  listen: rebuild initramfs

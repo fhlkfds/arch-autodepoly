@@ -172,6 +172,145 @@
   changed_when: false
   failed_when: false
 
+# --- Bootable snapshots ------------------------------------------------------
+# This play is a separate play from the one that runs the snapshots role, and a
+# role's defaults do not survive into a later play, so they are loaded here
+# explicitly. Loaded under a name rather than into the global namespace: a bare
+# include_vars outranks group_vars, which would silently shadow any override the
+# operator set there. Each value below therefore prefers whatever is already
+# defined and falls back to the role default.
+- name: Load the snapshot role defaults for this play
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/roles/snapshots/defaults/main.yml"
+    name: snapshot_role_defaults
+  tags: [verification, snapshots]
+
+- name: Resolve the snapshot settings to verify against
+  ansible.builtin.set_fact:
+    verify_snap_enabled: "{{ snapshots_enabled | default(snapshot_role_defaults.snapshots_enabled) }}"
+    verify_snap_boot: "{{ snapshots_boot_integration | default(snapshot_role_defaults.snapshots_boot_integration) }}"
+    verify_snap_machi: "{{ machi_enabled | default(snapshot_role_defaults.machi_enabled) }}"
+    verify_snap_mountpoint: "{{ snapshots_mountpoint | default(snapshot_role_defaults.snapshots_mountpoint) }}"
+    verify_snap_subvolume: "{{ snapshots_subvolume_name | default(snapshot_role_defaults.snapshots_subvolume_name) }}"
+    verify_snap_config: "{{ snapshots_config_name | default(snapshot_role_defaults.snapshots_config_name) }}"
+    verify_snap_grub_dir: "{{ snapshots_grub_dir | default(snapshot_role_defaults.snapshots_grub_dir) }}"
+    verify_snap_generator: "{{ snapshots_grub_btrfs_generator | default(snapshot_role_defaults.snapshots_grub_btrfs_generator) }}"
+    verify_snap_mkinitcpio: "{{ snapshots_mkinitcpio_conf | default(snapshot_role_defaults.snapshots_mkinitcpio_conf) }}"
+    verify_snap_hook_name: "{{ snapshots_overlayfs_hook_name | default(snapshot_role_defaults.snapshots_overlayfs_hook_name) }}"
+    verify_snap_machi_bin: "{{ machi_bin_path | default(snapshot_role_defaults.machi_bin_path) }}"
+  tags: [verification, snapshots]
+
+# Skipped rather than failed when the snapshots role is disabled, so a host
+# provisioned with snapshots_enabled=false still passes verification.
+
+- name: Check whether the snapshot store is mounted
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --output, "SOURCE,OPTIONS", --mountpoint, "{{ verify_snap_mountpoint }}"]
+  register: verify_snapshot_store
+  changed_when: false
+  failed_when: false
+  when: verify_snap_enabled | bool
+  tags: [verification, snapshots]
+
+- name: Read the snapper configuration in force
+  ansible.builtin.command:
+    argv: [snapper, --config, "{{ verify_snap_config }}", get-config]
+  register: verify_snapper_config
+  changed_when: false
+  failed_when: false
+  when: verify_snap_enabled | bool
+  tags: [verification, snapshots]
+
+- name: Read the snapshots that exist
+  ansible.builtin.command:
+    argv: [snapper, --config, "{{ verify_snap_config }}", list]
+  register: verify_snapper_list
+  changed_when: false
+  failed_when: false
+  when: verify_snap_enabled | bool
+  tags: [verification, snapshots]
+
+# The only place snap-pac looks for which configs to snapshot. Empty here means
+# no pre-update snapshot is ever taken, and nothing reports an error.
+
+- name: Read the snapper configurations registered for the pacman hooks
+  ansible.builtin.command:
+    argv: [grep, "^SNAPPER_CONFIGS=", /etc/conf.d/snapper]
+  register: verify_snap_pac_configs
+  changed_when: false
+  failed_when: false
+  when: verify_snap_enabled | bool
+  tags: [verification, snapshots]
+
+- name: Read the generated snapshot boot entries
+  ansible.builtin.command:
+    argv: [grep, -c, -e, "--class snapshots", "{{ verify_snap_grub_dir }}/grub-btrfs.cfg"]
+  register: verify_snapshot_boot_entries
+  changed_when: false
+  failed_when: false
+  when:
+    - verify_snap_enabled | bool
+    - verify_snap_boot | bool
+  tags: [verification, snapshots, boot]
+
+- name: Read the initramfs hooks that make a read-only snapshot bootable
+  ansible.builtin.command:
+    argv: [grep, "^HOOKS=", "{{ verify_snap_mkinitcpio }}"]
+  register: verify_snapshot_hooks
+  changed_when: false
+  failed_when: false
+  when:
+    - verify_snap_enabled | bool
+    - verify_snap_boot | bool
+  tags: [verification, snapshots, boot]
+
+- name: Read the machi snapshot commands
+  ansible.builtin.command:
+    argv: ["{{ verify_snap_machi_bin }}", snapshot, --help]
+  register: verify_machi
+  changed_when: false
+  failed_when: false
+  when: verify_snap_machi | bool
+  tags: [verification, snapshots, machi]
+
+- name: Assert the bootable snapshot system is in force
+  ansible.builtin.assert:
+    that:
+      - (verify_snapshot_store.rc | default(1)) == 0
+      - verify_snap_subvolume in (verify_snapshot_store.stdout | default(''))
+      - "'SUBVOLUME' in (verify_snapper_config.stdout | default(''))"
+      - verify_snap_config in (verify_snap_pac_configs.stdout | default(''))
+      - (verify_machi.rc | default(1)) == 0 or not (verify_snap_machi | bool)
+    fail_msg: >-
+      The snapshot system is not fully in force. Store mount:
+      {{ verify_snapshot_store.stdout | default('not mounted') }}. snap-pac
+      configs: {{ verify_snap_pac_configs.stdout | default('unset') }}. See
+      docs/snapshots.md.
+  when: verify_snap_enabled | bool
+  tags: [verification, snapshots, boot]
+
+# Separate from the assertion above so the reason is specific: entries exist in
+# grub-btrfs.cfg, the overlayfs hook is in the initramfs, and grub.cfg sources
+# the submenu. Only meaningful once at least one snapshot exists.
+
+- name: Assert snapshots are actually bootable
+  ansible.builtin.assert:
+    that:
+      - verify_snap_hook_name in (verify_snapshot_hooks.stdout | default(''))
+      - (verify_snapshot_boot_entries.stdout | default('0') | trim | int) > 0
+    fail_msg: >-
+      Snapshots exist but are not bootable.
+      HOOKS: {{ verify_snapshot_hooks.stdout | default('unknown') }}.
+      Boot entries in {{ verify_snap_grub_dir }}/grub-btrfs.cfg:
+      {{ verify_snapshot_boot_entries.stdout | default('0') | trim }}.
+      Regenerate with `sudo {{ verify_snap_generator }}`; see the
+      boot-menu troubleshooting in docs/snapshots.md.
+  when:
+    - verify_snap_enabled | bool
+    - verify_snap_boot | bool
+    - (verify_snapper_list.stdout_lines | default([]) | length) > 3
+  tags: [verification, snapshots, boot]
+
 - name: Assert final user, services, hardening, and Stow state
   ansible.builtin.assert:
     that:
@@ -216,6 +355,14 @@
       ssh         syntax, effective policy, fresh liam key connection         PASS
       ufw         active; rate-limited configured SSH port present            PASS
       fail2ban    sshd jail active with nftables action                       PASS
+      snapshots   snapper config, {{ verify_snap_subvolume }} store mounted, snap-pac registered   {{
+        'PASS' if verify_snap_enabled | bool else 'SKIPPED (snapshots_enabled=false)' }}
+      boot        {{ verify_snapshot_boot_entries.stdout | default('0') | trim }} snapshot entries in grub-btrfs.cfg; overlayfs hook in HOOKS   {{
+        'PASS'
+        if (verify_snap_enabled | bool and verify_snap_boot | bool)
+        else 'SKIPPED' }}
+      machi       machi snapshot create/list/cleanup available                {{
+        'PASS' if verify_snap_machi | bool else 'SKIPPED (machi_enabled=false)' }}
 
 # Last task of the run, so the skipped packages are the final thing on screen
 # rather than something buried mid-play by the packages role hundreds of lines

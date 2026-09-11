@@ -1,0 +1,151 @@
+---
+# Everything machine-specific is discovered here and kept in facts, so no UUID,
+# device node or subvolume name is hardcoded anywhere in this role.
+
+- name: Read the root filesystem type, source and mount options
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --output, "FSTYPE,SOURCE,UUID,OPTIONS", --mountpoint, /]
+  register: snapshots_root_findmnt
+  changed_when: false
+
+- name: Read the root filesystem source without its subvolume suffix
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --nofsroot, --output, SOURCE, --mountpoint, /]
+  register: snapshots_root_device_probe
+  changed_when: false
+
+- name: Record the discovered root filesystem facts
+  vars:
+    snapshots_findmnt_fields: "{{ snapshots_root_findmnt.stdout | trim | split() }}"
+  ansible.builtin.set_fact:
+    snapshots_root_fstype: "{{ snapshots_findmnt_fields[0] }}"
+    # The block device holding the filesystem, e.g. /dev/mapper/root. Taken
+    # from --nofsroot so the "[/@]" subvolume suffix is not part of it.
+    snapshots_root_device: "{{ snapshots_root_device_probe.stdout | trim }}"
+    snapshots_root_uuid: "{{ snapshots_findmnt_fields[2] }}"
+    snapshots_root_options: "{{ snapshots_findmnt_fields[3] }}"
+
+# This is the one condition the whole design rests on. Stop here rather than
+# install packages and write hooks that could never work.
+- name: Require a Btrfs root filesystem
+  ansible.builtin.assert:
+    that:
+      - snapshots_root_fstype == "btrfs"
+    fail_msg: >-
+      The root filesystem is {{ snapshots_root_fstype }}, not btrfs. Bootable
+      snapshots as designed here are btrfs-only: they rely on
+      `btrfs subvolume snapshot` and on GRUB booting a subvolume by name, and
+      neither has an equivalent on {{ snapshots_root_fstype }}. Nothing has
+      been changed. Set snapshots_enabled=false to skip this role, or migrate
+      the root filesystem to btrfs first.
+    success_msg: "Root filesystem is btrfs on {{ snapshots_root_device }}."
+
+- name: Read the subvolume the root filesystem is mounted from
+  ansible.builtin.command:
+    argv: [btrfs, subvolume, show, /]
+  register: snapshots_root_subvol_show
+  changed_when: false
+
+- name: List the existing top-level subvolumes
+  ansible.builtin.command:
+    argv: [btrfs, subvolume, list, /]
+  register: snapshots_subvol_list
+  changed_when: false
+
+- name: Record the discovered subvolume facts
+  ansible.builtin.set_fact:
+    # e.g. "@". Snapshot boot entries are generated relative to the filesystem
+    # root, so this is what tells us whether the layout is the flat @ one.
+    snapshots_root_subvol: >-
+      {{ snapshots_root_subvol_show.stdout
+         | regex_search('^\s*Name:\s+(\S+)', '\1', multiline=True) | first | default('') }}
+    snapshots_store_exists: >-
+      {{ snapshots_subvol_list.stdout_lines
+         | select('regex', '\spath\s+' ~ (snapshots_subvolume_name | regex_escape) ~ '$')
+         | list | length > 0 }}
+
+- name: Require a named root subvolume
+  ansible.builtin.assert:
+    that:
+      - snapshots_root_subvol | length > 0
+      - snapshots_root_subvol != "<FS_TREE>"
+    fail_msg: >-
+      / is mounted from the filesystem root (subvolid=5) rather than from a
+      named subvolume. A snapshot of the filesystem root cannot be booted as a
+      subvolume, and rolling one back would mean replacing the filesystem
+      root itself. Nothing has been changed. Move the system onto a subvolume
+      (this host uses @) before enabling this role.
+
+# Which volatile paths are already excluded is a property of the live layout,
+# not something to assume. Anything mounted below / from the same filesystem is
+# a separate subvolume, and `btrfs subvolume snapshot` does not descend into
+# nested subvolumes, so both kinds are excluded from a snapshot of @ for free.
+- name: Record which paths are excluded from a snapshot of the root subvolume
+  vars:
+    snapshots_same_fs_mounts: >-
+      {{ ansible_facts.mounts | default([])
+         | selectattr('device', 'eq', snapshots_root_device)
+         | rejectattr('mount', 'eq', '/')
+         | map(attribute='mount') | sort | list }}
+    snapshots_nested_subvols: >-
+      {{ snapshots_subvol_list.stdout_lines
+         | map('regex_search', '\spath\s+(\S+)$', '\1')
+         | select() | map('first')
+         | reject('match', '^@')
+         | map('regex_replace', '^', '/')
+         | sort | list }}
+  ansible.builtin.set_fact:
+    snapshots_excluded_paths: >-
+      {{ (snapshots_same_fs_mounts + snapshots_nested_subvols
+          + ((ansible_facts.mounts | default([])
+              | selectattr('fstype', 'in', ['tmpfs', 'vfat'])
+              | map(attribute='mount') | list))) | unique | sort | list }}
+
+# --- Bootloader detection ----------------------------------------------------
+# Detected, never assumed. grub-btrfs is the only snapshot boot integration
+# this role implements; on a host booting something else the boot tasks are
+# skipped with an explanation instead of writing a GRUB config nothing reads.
+- name: Check for an installed GRUB
+  ansible.builtin.stat:
+    path: "{{ snapshots_grub_cfg_path }}"
+  register: snapshots_grub_cfg_stat
+
+- name: Check whether grub-mkconfig is installed
+  ansible.builtin.stat:
+    path: /usr/bin/grub-mkconfig
+  register: snapshots_grub_mkconfig_stat
+
+- name: Check whether systemd-boot owns the EFI system partition
+  ansible.builtin.stat:
+    path: /boot/EFI/systemd/systemd-bootx64.efi
+  register: snapshots_systemd_boot_stat
+
+# A unified kernel image bakes its own cmdline in at build time, so a GRUB menu
+# entry that overrides rootflags=subvol= never reaches it. If this host is ever
+# switched to booting a UKI, snapshot entries would still be generated but
+# would not be what the firmware loads, so say so rather than claim otherwise.
+- name: Look for unified kernel images on the EFI system partition
+  ansible.builtin.find:
+    paths: /boot/EFI/Linux
+    patterns: ["*.efi"]
+    file_type: file
+  register: snapshots_uki_find
+  failed_when: false
+
+- name: Record the detected bootloader
+  ansible.builtin.set_fact:
+    snapshots_grub_present: >-
+      {{ snapshots_grub_cfg_stat.stat.exists and snapshots_grub_mkconfig_stat.stat.exists }}
+    snapshots_uki_present: "{{ (snapshots_uki_find.files | default([])) | length > 0 }}"
+    snapshots_systemd_boot_present: "{{ snapshots_systemd_boot_stat.stat.exists }}"
+
+- name: Report the detected boot arrangement
+  ansible.builtin.debug:
+    msg: >-
+      Root {{ snapshots_root_device }} ({{ snapshots_root_uuid }}) on subvolume
+      {{ snapshots_root_subvol }}.
+      Bootloader: {{ 'GRUB' if snapshots_grub_present else 'not GRUB' }}{{
+        ', systemd-boot also present' if snapshots_systemd_boot_present else '' }}{{
+        ', unified kernel images present' if snapshots_uki_present else '' }}.
+      Paths already excluded from a snapshot of {{ snapshots_root_subvol }}:
+      {{ snapshots_excluded_paths | join(' ') }}.
